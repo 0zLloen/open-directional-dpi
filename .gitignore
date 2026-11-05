@@ -1,0 +1,18 @@
+# Upstream clones & extracted vendor binaries (never commit to Git)
+upstream/
+artifacts/
+PROGRESS.md
+hardware/glorious-series-one-pro/stock/
+hardware/glorious-series-one-pro/build/
+
+# Build outputs
+tests/test_directional_dpi
+adapters/linux-evdev/odd_evdev_filter
+*.o
+*.elf
+*.bin
+*.hex
+node_modules/
+dist/
+__pycache__/
+*.pyc

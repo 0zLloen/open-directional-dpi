@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+
+config ZMK_INPUT_PROCESSOR_DIRECTIONAL_DPI
+    bool "Open Directional DPI v1 Input Processor for ZMK"
+    default y
+    depends on DT_HAS_ZMK_INPUT_PROCESSOR_DIRECTIONAL_DPI_ENABLED
+    help
+      Enables the Open Directional DPI v1 8-octant directional sensitivity
+      processor and persistent Zephyr settings/NVS profile storage.
+
+if ZMK_INPUT_PROCESSOR_DIRECTIONAL_DPI
+
+config ZMK_DIRECTIONAL_DPI_SETTINGS_SAVE_DELAY_MS
+    int "Delay in milliseconds before committing profile updates to flash"
+    default 500
+
+endif # ZMK_INPUT_PROCESSOR_DIRECTIONAL_DPI

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-core-and-integrations:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build and run C Reference Engine unit tests
+        run: |
+          make -C tests clean
+          make -C tests test
+
+      - name: Compile Linux evdev-to-uinput host filter
+        run: |
+          make -C adapters/linux-evdev clean
+          make -C adapters/linux-evdev
+
+      - name: Run OpenMouse TypeScript protocol & engine parity tests
+        run: |
+          node --experimental-strip-types --test integrations/openmouse/test/directional-dpi.test.ts
+
+      - name: Run Calibration pipeline & provider tests
+        run: |
+          node --experimental-strip-types --test calibration/tests/calibration.test.ts

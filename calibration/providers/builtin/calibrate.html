@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Open Directional Sensitivity — 8-Direction Biomechanical Calibration</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --panel: #111827;
+      --border: #1f2937;
+      --text: #f3f4f6;
+      --muted: #9ca3af;
+      --accent: #38bdf8;
+      --good: #34d399;
+      --warn: #fbbf24;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      height: 100vh;
+      overflow: hidden;
+    }
+    aside {
+      background: var(--panel);
+      border-right: 1px solid var(--border);
+      padding: 20px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    h1 { font-size: 1.1rem; margin: 0; }
+    p { margin: 0; font-size: 0.85rem; color: var(--muted); line-height: 1.45; }
+    .controls { display: grid; gap: 10px; }
+    label { font-size: 0.8rem; color: var(--muted); display: flex; justify-content: space-between; }
+    input, select, button {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #1f2937;
+      color: var(--text);
+      font-size: 0.85rem;
+    }
+    button.primary {
+      background: var(--accent);
+      color: #030712;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.78rem;
+    }
+    th, td {
+      padding: 5px 4px;
+      border-bottom: 1px solid var(--border);
+      text-align: right;
+    }
+    th:first-child, td:first-child { text-align: left; }
+    pre {
+      background: #030712;
+      padding: 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      font-size: 0.72rem;
+      overflow-x: auto;
+      margin: 0;
+    }
+    main {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: crosshair;
+    }
+  </style>
+</head>
+<body>
+  <aside>
+    <h1>Open Directional Sensitivity Calibration</h1>
+    <p>Measures primary-submovement overshoot/undershoot across 8 counter-clockwise directions (<code>odd-sensor-ccw</code>) using raw Pointer Lock input.</p>
+    <div class="controls">
+      <label>Base Sensor CPI <input type="number" id="baseCpi" value="800" min="50" max="42000" step="50" /></label>
+      <label>Trials per Direction <input type="number" id="trialsPerDir" value="8" min="3" max="40" /></label>
+      <label>Travel Window L (counts) <input type="number" id="windowCounts" value="16" min="0" max="128" /></label>
+      <button class="primary" id="startBtn">Start Calibration (Pointer Lock)</button>
+      <button id="exportBtn">Download odd.profile.v1 JSON</button>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Sector (CCW)</th><th>Trials</th><th>Med. Ratio</th><th>Gain</th></tr>
+      </thead>
+      <tbody id="sectorTable"></tbody>
+    </table>
+    <pre id="profileJson"></pre>
+  </aside>
+  <main>
+    <canvas id="arena"></canvas>
+  </main>
+  <script>
+    const SECTORS_CCW = [
+      { idx: 0, deg: 0,   name: "0° Right (+X)" },
+      { idx: 1, deg: 45,  name: "45° Away-Right" },
+      { idx: 2, deg: 90,  name: "90° Away (-Y)" },
+      { idx: 3, deg: 135, name: "135° Away-Left" },
+      { idx: 4, deg: 180, name: "180° Left (-X)" },
+      { idx: 5, deg: 225, name: "225° Toward-Left" },
+      { idx: 6, deg: 270, name: "270° Toward (+Y)" },
+      { idx: 7, deg: 315, name: "315° Toward-Right" }
+    ];
+
+    const canvas = document.getElementById("arena");
+    const ctx = canvas.getContext("2d");
+    const ratiosBySector = Array.from({ length: 8 }, () => []);
+    let queue = [];
+    let currentTrial = null;
+    let state = "IDLE"; // IDLE | WAIT_CENTER | FLICK
+    let cursor = { x: 0, y: 0 };
+    let trace = [];
+
+    function resize() {
+      canvas.width = canvas.clientWidth;
+      canvas.height = canvas.clientHeight;
+      draw();
+    }
+    window.addEventListener("resize", resize);
+
+    function median(arr) {
+      if (!arr.length) return 1.0;
+      const s = [...arr].sort((a, b) => a - b);
+      const m = Math.floor(s.length / 2);
+      return s.length % 2 ? s[m] : 0.5 * (s[m - 1] + s[m]);
+    }
+
+    function computeGains() {
+      const rawGains = ratiosBySector.map(r => {
+        const med = median(r);
+        return Math.min(1.25, Math.max(0.80, 1.0 / med));
+      });
+      return rawGains.map((g, i) => {
+        if (!ratiosBySector[i].length) return 1.0;
+        const prev = rawGains[(i + 7) % 8];
+        const next = rawGains[(i + 1) % 8];
+        return Number((0.15 * prev + 0.70 * g + 0.15 * next).toFixed(4));
+      });
+    }
+
+    function updateTableAndJson() {
+      const gains = computeGains();
+      const tbody = document.getElementById("sectorTable");
+      tbody.innerHTML = SECTORS_CCW.map((s, i) => {
+        const r = ratiosBySector[i];
+        const med = r.length ? median(r).toFixed(3) : "—";
+        return `<tr><td>${s.name}</td><td>${r.length}</td><td>${med}</td><td>${gains[i].toFixed(3)}x</td></tr>`;
+      }).join("");
+
+      const baseCpi = Number(document.getElementById("baseCpi").value) || 800;
+      const windowCounts = Number(document.getElementById("windowCounts").value) || 16;
+      const maxGain = Math.max(...gains, 1.0);
+      const profile = {
+        schema: "odd.profile.v1",
+        name: "Calibrated Aim Profile",
+        model: "angular-gain",
+        frame: "odd-sensor-ccw",
+        baseCpi,
+        recommendedSensorCpi: Math.round(baseCpi * maxGain),
+        gains,
+        interpolation: "circular-periodic",
+        estimator: {
+          type: "travel-window",
+          lengthCounts: windowCounts,
+          idleResetMs: 50
+        },
+        normalization: "cpi-headroom",
+        calibration: {
+          tool: "odd-calibrate/0.1",
+          date: new Date().toISOString().slice(0, 10),
+          trialsPerDirection: Number(document.getElementById("trialsPerDir").value) || 8
+        }
+      };
+      document.getElementById("profileJson").textContent = JSON.stringify(profile, null, 2);
+      return profile;
+    }
+
+    function buildQueue() {
+      const n = Number(document.getElementById("trialsPerDir").value) || 8;
+      const distances = [140, 210, 280];
+      queue = [];
+      for (let t = 0; t < n; t++) {
+        for (let s = 0; s < 8; s++) {
+          const dist = distances[t % distances.length];
+          queue.push({ sector: s, dist });
+        }
+      }
+      for (let i = queue.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [queue[i], queue[j]] = [queue[j], queue[i]];
+      }
+    }
+
+    function evaluateSubmovementRatio(tracePoints, targetDist) {
+      if (tracePoints.length < 4) return null;
+      let peakSpeed = 0;
+      let passedPeak = false;
+      for (let i = 1; i < tracePoints.length; i++) {
+        const dt = Math.max(1, tracePoints[i].t - tracePoints[i - 1].t);
+        const dx = tracePoints[i].x - tracePoints[i - 1].x;
+        const dy = tracePoints[i].y - tracePoints[i - 1].y;
+        const speed = Math.hypot(dx, dy) / dt;
+        const distFromStart = Math.hypot(tracePoints[i].x, tracePoints[i].y);
+        if (speed > peakSpeed) {
+          peakSpeed = speed;
+        } else if (peakSpeed > 0.25 && distFromStart > targetDist * 0.45 && speed < peakSpeed * 0.18) {
+          passedPeak = true;
+          return distFromStart / targetDist;
+        }
+      }
+      const last = tracePoints[tracePoints.length - 1];
+      return Math.hypot(last.x, last.y) / targetDist;
+    }
+
+    function draw() {
+      const cx = canvas.width / 2;
+      const cy = canvas.height / 2;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw 8 sector rays
+      ctx.strokeStyle = "#1f2937";
+      ctx.lineWidth = 1;
+      for (let s = 0; s < 8; s++) {
+        const rad = (s * 45) * Math.PI / 180;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(cx + 300 * Math.cos(rad), cy - 300 * Math.sin(rad));
+        ctx.stroke();
+      }
+
+      // Draw center home ring
+      ctx.strokeStyle = state === "WAIT_CENTER" ? "#38bdf8" : "#374151";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 16, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Draw active target
+      if (state === "FLICK" && currentTrial) {
+        const rad = (currentTrial.sector * 45) * Math.PI / 180;
+        const tx = cx + currentTrial.dist * Math.cos(rad);
+        const ty = cy - currentTrial.dist * Math.sin(rad);
+        ctx.fillStyle = "#34d399";
+        ctx.beginPath();
+        ctx.arc(tx, ty, 14, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Draw cursor
+      ctx.fillStyle = "#f8fafc";
+      ctx.beginPath();
+      ctx.arc(cx + cursor.x, cy + cursor.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    document.getElementById("startBtn").addEventListener("click", async () => {
+      ratiosBySector.forEach(a => a.length = 0);
+      buildQueue();
+      cursor = { x: 0, y: 0 };
+      state = "WAIT_CENTER";
+      try {
+        await canvas.requestPointerLock({ unadjustedMovement: true });
+      } catch {
+        canvas.requestPointerLock();
+      }
+      updateTableAndJson();
+      draw();
+    });
+
+    document.addEventListener("mousemove", (e) => {
+      if (document.pointerLockElement !== canvas) return;
+      cursor.x += e.movementX;
+      cursor.y += e.movementY;
+      if (state === "FLICK") {
+        trace.push({ x: cursor.x, y: cursor.y, t: performance.now() });
+      }
+      draw();
+    });
+
+    canvas.addEventListener("mousedown", () => {
+      if (document.pointerLockElement !== canvas) return;
+      if (state === "WAIT_CENTER") {
+        if (Math.hypot(cursor.x, cursor.y) <= 20) {
+          currentTrial = queue.pop() || null;
+          if (!currentTrial) {
+            state = "IDLE";
+            document.exitPointerLock();
+          } else {
+            cursor = { x: 0, y: 0 };
+            trace = [{ x: 0, y: 0, t: performance.now() }];
+            state = "FLICK";
+          }
+        } else {
+          cursor = { x: 0, y: 0 };
+        }
+      } else if (state === "FLICK" && currentTrial) {
+        const ratio = evaluateSubmovementRatio(trace, currentTrial.dist);
+        if (ratio && ratio > 0.4 && ratio < 2.0) {
+          ratiosBySector[currentTrial.sector].push(ratio);
+        }
+        cursor = { x: 0, y: 0 };
+        state = queue.length ? "WAIT_CENTER" : "IDLE";
+        if (state === "IDLE") document.exitPointerLock();
+        updateTableAndJson();
+      }
+      draw();
+    });
+
+    document.getElementById("exportBtn").addEventListener("click", () => {
+      const profile = updateTableAndJson();
+      const blob = new Blob([JSON.stringify(profile, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "odd-calibrated-profile.json";
+      a.click();
+    });
+
+    resize();
+    updateTableAndJson();
+  </script>
+</body>
+</html>

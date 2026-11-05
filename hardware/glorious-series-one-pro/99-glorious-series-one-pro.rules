@@ -1,0 +1,16 @@
+# Glorious Forge Series One Pro Wireless — Open Directional DPI & OpenMouse udev rules
+# Grants active desktop user (uaccess) and plugdev group read/write access to:
+#   - 258a:2018 (Wired Mouse Application)
+#   - 258a:2103 (Wired Mouse Resident Compx Bootloader)
+#   - 258a:2031 (Wireless 2.4 GHz Receiver Application)
+#   - 258a:2113 (Wireless 2.4 GHz Receiver Resident Compx Bootloader)
+
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2018", MODE="0666", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2103", MODE="0666", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2031", MODE="0666", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2113", MODE="0666", GROUP="plugdev", TAG+="uaccess"
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="258a", ATTR{idProduct}=="2018", MODE="0666", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="258a", ATTR{idProduct}=="2103", MODE="0666", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="258a", ATTR{idProduct}=="2031", MODE="0666", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="258a", ATTR{idProduct}=="2113", MODE="0666", GROUP="plugdev", TAG+="uaccess"

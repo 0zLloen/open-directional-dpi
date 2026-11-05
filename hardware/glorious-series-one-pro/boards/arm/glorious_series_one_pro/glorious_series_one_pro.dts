@@ -1,0 +1,201 @@
+/*
+ * Glorious Forge Series One Pro Wireless (CM2852-BAMF) — ZMK / Zephyr Board Devicetree
+ *
+ * All GPIO pins, SPI2 sensor bus, flash partitions, and bootloader magic RAM
+ * reservation verified directly from CM2856_Mouse_USB_v1.00.00_20220810.hex.
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+/dts-v1/;
+#include <nordic/nrf52840_qiaa.dtsi>
+#include <dt-bindings/zmk/keys.h>
+#include <dt-bindings/zmk/pointing.h>
+
+/ {
+    model = "Glorious Forge Series One Pro Wireless (CM2852-BAMF)";
+    compatible = "glorious,series-one-pro", "nordic,nrf52840-qiaa", "nordic,nrf52840";
+
+    chosen {
+        zephyr,code-partition = &code_partition;
+        zephyr,sram = &sram0;
+        zephyr,flash = &flash0;
+        zmk,kscan = &kscan0;
+    };
+
+    /*
+     * Reserve top 16 bytes of 256 KB SRAM (0x2003FFF0..0x2003FFFF) so the
+     * Compx USB HID Bootloader magic word at 0x2003FFFC (0xA55AA55A) is
+     * never overwritten by stack or heap allocations.
+     */
+    sram@2003FFF0 {
+        compatible = "zephyr,memory-region";
+        reg = <0x2003FFF0 0x00000010>;
+        zephyr,memory-region = "BOOTLOADER_MAGIC_RAM";
+    };
+
+    /* Direct GPIO Mouse Buttons (Verified from 0x0000C5B8 & 0x00016B3C) */
+    kscan0: kscan {
+        compatible = "zmk,kscan-gpio-direct";
+        wakeup-source;
+        input-gpios
+            = <&gpio1 15 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)> /* Btn 0: Left Click (LMB)   */
+            , <&gpio1 13 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)> /* Btn 1: Right Click (RMB)  */
+            , <&gpio1 10 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)> /* Btn 2: Middle Click (MMB) */
+            , <&gpio0  9 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)> /* Btn 3: Back (Side 4, NFC1)*/
+            , <&gpio0 10 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)> /* Btn 4: Fwd  (Side 5, NFC2)*/
+            , <&gpio1  0 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)> /* Btn 5: DPI Cycle Button   */
+            ;
+    };
+
+    /* Scroll Wheel Quadrature Encoder (Verified from 0x0000C5F8 & 0x00016CB2) */
+    wheel_encoder: encoder_wheel {
+        compatible = "alps,ec11";
+        a-gpios = <&gpio0 29 (GPIO_ACTIVE_HIGH | GPIO_PULL_UP)>;
+        b-gpios = <&gpio0  2 (GPIO_ACTIVE_HIGH | GPIO_PULL_UP)>;
+        steps = <24>;
+        status = "okay";
+    };
+
+    /* Peripheral Power Rail Enables (Verified from 0x0000C61A & 0x0000C636) */
+    sensor_pwr: regulator-sensor-pwr {
+        compatible = "regulator-fixed";
+        regulator-name = "sensor-pwr-en";
+        enable-gpios = <&gpio0 26 GPIO_ACTIVE_HIGH>;
+        regulator-boot-on;
+    };
+
+    led_pwr: regulator-led-pwr {
+        compatible = "regulator-fixed";
+        regulator-name = "led-pwr-en";
+        enable-gpios = <&gpio0 14 GPIO_ACTIVE_HIGH>;
+        regulator-boot-on;
+    };
+
+    /* Open Directional DPI v1 Input Processor Node */
+    ddpi_processor: directional_dpi_processor {
+        compatible = "zmk,input-processor-directional-dpi";
+        #input-processor-cells = <0>;
+        base-dpi = <800>;
+        global-gain-q8-8 = <256>;
+        multipliers-q8-8 = <256 256 256 256 256 256 256 256>;
+        status = "okay";
+    };
+
+    /* Input Listener chaining PAW3370 sensor through Open Directional DPI v1 */
+    mouse_input_listener {
+        compatible = "zmk,input-listener";
+        device = <&paw3370_bamf>;
+        input-processors = <&ddpi_processor>;
+    };
+};
+
+/* Reserve 0x2003FFF0..0x2003FFFF outside main Zephyr SRAM */
+&sram0 {
+    reg = <0x20000000 0x0003FFF0>;
+};
+
+/* P0.09 and P0.10 are used for Side Buttons 4 & 5, not NFC antenna */
+&uicr {
+    nfcpins-as-gpios;
+};
+
+&gpio0 {
+    status = "okay";
+};
+
+&gpio1 {
+    status = "okay";
+};
+
+&gpiote {
+    status = "okay";
+};
+
+/*
+ * SPI2 Bus for Glorious BAMF / PixArt PAW3370 Optical Sensor
+ * Verified from 0x000184C8..0x0001855C:
+ *   CSN  = P0.04
+ *   SCK  = P0.12
+ *   MISO = P0.11
+ *   MOSI = P0.08
+ *   IRQ  = P0.06 (MOTION active-low interrupt)
+ *   Freq = 4 MHz, SPI Mode 3 (CPOL=1, CPHA=1)
+ */
+&pinctrl {
+    spi2_default: spi2_default {
+        group1 {
+            psels = <NRF_PSEL(SPIM_SCK, 0, 12)>,
+                    <NRF_PSEL(SPIM_MOSI, 0, 8)>,
+                    <NRF_PSEL(SPIM_MISO, 0, 11)>;
+        };
+    };
+
+    spi2_sleep: spi2_sleep {
+        group1 {
+            psels = <NRF_PSEL(SPIM_SCK, 0, 12)>,
+                    <NRF_PSEL(SPIM_MOSI, 0, 8)>,
+                    <NRF_PSEL(SPIM_MISO, 0, 11)>;
+            low-power-enable;
+        };
+    };
+};
+
+&spi2 {
+    compatible = "nordic,nrf-spim";
+    status = "okay";
+    pinctrl-0 = <&spi2_default>;
+    pinctrl-1 = <&spi2_sleep>;
+    pinctrl-names = "default", "sleep";
+    cs-gpios = <&gpio0 4 GPIO_ACTIVE_LOW>;
+
+    paw3370_bamf: paw3370@0 {
+        compatible = "pixart,paw3370";
+        reg = <0>;
+        spi-max-frequency = <4000000>;
+        irq-gpios = <&gpio0 6 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+        cpi = <800>;
+    };
+};
+
+&usbd {
+    compatible = "nordic,nrf-usbd";
+    status = "okay";
+};
+
+/*
+ * Flash Partition Layout (Preserves Compx Bootloader AND Stock Calibration/Pairing!)
+ *   0x00000000..0x00005FFF (24 KB):  Compx Resident USB HID Bootloader (258a:2103)
+ *   0x00006000..0x0007DFFF (480 KB): Custom Application Firmware Partition
+ *   0x0007E000..0x0007FFFF (8 KB):   Dedicated Open Directional DPI NVS Storage
+ *   0x00088000..0x000DFFFF:          UNTOUCHED Stock RF Pairing & Profile Flash
+ */
+&flash0 {
+    partitions {
+        compatible = "fixed-partitions";
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        compx_boot_partition: partition@0 {
+            label = "compx_bootloader";
+            reg = <0x00000000 0x00006000>;
+            read-only;
+        };
+
+        code_partition: partition@6000 {
+            label = "image-0";
+            reg = <0x00006000 0x00078000>;
+        };
+
+        storage_partition: partition@7e000 {
+            label = "storage";
+            reg = <0x0007E000 0x00002000>;
+        };
+
+        stock_reserved_partition: partition@88000 {
+            label = "stock_pairing_and_profiles";
+            reg = <0x00088000 0x00058000>;
+            read-only;
+        };
+    };
+};
