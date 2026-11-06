@@ -21,7 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 PATCH_DIR = Path(__file__).resolve().parent
 STOCK_DIR = PATCH_DIR.parent / "stock"
 BUILD_DIR = PATCH_DIR.parent / "build"

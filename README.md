@@ -33,15 +33,14 @@ open-directional-dpi/
 │   ├── zmk/                         # ZMK Firmware input processor module (`zmk,input-processor-directional-dpi`)
 │   ├── qmk/                         # QMK Firmware `pointing_device` adapter (`pointing_device_task_odd`)
 │   ├── zgm/                         # Keychron ZGM / Zephyr high-polling paired sensor frame filter
-│   └── linux-evdev/                 # Linux `evdev`-to-`uinput` host prototype for testing on any mouse
+│   ├── linux-evdev/                 # Linux `evdev`-to-`uinput` host prototype for testing on any mouse
+│   └── glorious-cm2856/             # Binary hook adapter (`stock_ddpi_patch.c/.ld`) for ARM Cortex-M4F firmware
 ├── integrations/
 │   └── openmouse/
 │       ├── index.html               # Standalone WebHID 8-octant polar sensitivity editor & live simulator
 │       ├── calibrate.html           # 5-minute Pointer Lock biomechanical calibration tool
 │       ├── src/directional-dpi.ts   # TypeScript codec, bit-exact engine mirror, and WebHID client
 │       └── test/                    # Automated TypeScript parity and mock-HID test suites
-├── hardware/
-│   └── glorious-series-one-pro/     # Hardware port, reverse engineering, and surgical patch for Glorious Series One Pro
 ├── .github/workflows/
 │   └── ci.yml                       # Automated C, Linux evdev, and TypeScript CI pipeline
 ├── LICENSE                          # MIT License

@@ -8,7 +8,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "../../../core/directional_dpi.h"
+#include "../../core/directional_dpi.h"
 
 /* Minimal freestanding memcpy / memset / memcmp for -nostdlib builds */
 void *memcpy(void *dst, const void *src, size_t n) {
