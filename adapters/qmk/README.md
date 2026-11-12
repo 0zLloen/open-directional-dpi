@@ -1,13 +1,46 @@
 # QMK Adapter (`adapters/qmk/`)
 
-Integrates the portable C reference engine ([`core/directional_dpi.c`](../../core/directional_dpi.c)) into QMK's `pointing_device` pipeline.
+Integrates the portable C reference engine ([`core/directional_dpi.c`](../../core/directional_dpi.c)) into QMK's `pointing_device` pipeline. Works with any QMK pointing device driver (PMW33xx, PAW3222, ADNS, Cirque, ...): it only touches the `report_mouse_t` that `pointing_device_task_user()` receives.
 
 ## Setup
 
-1. Enable 16-bit mouse reports in your `rules.mk`:
+1. Put this repository inside your keymap folder, e.g. `keymaps/<you>/odd/` (QMK adds the keymap folder to its source and include search paths).
+2. `rules.mk`:
    ```makefile
    POINTING_DEVICE_ENABLE = yes
    MOUSE_EXTENDED_REPORT = yes
-   SRC += ../../core/directional_dpi.c odd_pointing_device.c
+   SRC += odd/core/directional_dpi.c odd/adapters/qmk/odd_pointing_device.c
    ```
-2. Call `pointing_device_task_odd(mouse_report)` inside `pointing_device_task_user(report_mouse_t mouse_report)`.
+3. `keymap.c`:
+   ```c
+   #include "odd/core/directional_dpi.h"
+
+   void           odd_qmk_init(uint16_t base_dpi);
+   ddpi_engine_t *odd_qmk_get_engine(void);
+   report_mouse_t pointing_device_task_odd(report_mouse_t mouse_report);
+
+   void keyboard_post_init_user(void) {
+       odd_qmk_init(pointing_device_get_cpi()); /* travel window L = 16 counts */
+       ddpi_profile_v1_t p = odd_qmk_get_engine()->profile;
+       p.flags |= DDPI_FLAG_ENABLED;
+       p.multipliers_q8_8[DDPI_DIR_S] = 0x00C0; /* 0.75x toward you; values from the calibration tool */
+       ddpi_engine_set_profile(odd_qmk_get_engine(), &p);
+   }
+
+   report_mouse_t pointing_device_task_user(report_mouse_t mouse_report) {
+       return pointing_device_task_odd(mouse_report);
+   }
+   ```
+
+The direction estimator restarts after the profile's idle gap (default 50 ms) using `timer_read32()`, so each flick starts from its own direction.
+
+## Report width
+
+Without `MOUSE_EXTENDED_REPORT`, QMK reports are 8-bit: drivers already clamp the sensor delta to ±127 (`CONSTRAIN_HID_XY`) before `pointing_device_task_user()` runs, and the adapter saturates the scaled output to ±127 too, so fast motion with gains above 1.00x loses counts. Enable `MOUSE_EXTENDED_REPORT`, or keep all gains ≤ 1.00x and raise the sensor CPI instead (`ddpi_profile_normalize_cpi_headroom()` computes it).
+
+## Compile check without QMK
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -pedantic -c odd_pointing_device.c -o /dev/null
+gcc -std=c11 -Wall -Wextra -Werror -pedantic -DMOUSE_EXTENDED_REPORT -c odd_pointing_device.c -o /dev/null
+```

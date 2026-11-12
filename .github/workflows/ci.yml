@@ -23,10 +23,28 @@ jobs:
           make -C tests clean
           make -C tests test
 
-      - name: Compile Linux evdev-to-uinput host filter
+      - name: Check conformance vectors match the C engine
+        run: |
+          make -C tests vectors
+          git diff --exit-code -- tests/vectors
+
+      - name: Build Linux evdev-to-uinput host filter and run its self-test
         run: |
           make -C adapters/linux-evdev clean
-          make -C adapters/linux-evdev
+          make -C adapters/linux-evdev check
+
+      - name: Compile QMK pointing-device adapter (8-bit and extended reports)
+        run: |
+          gcc -std=c11 -Wall -Wextra -Werror -pedantic -c adapters/qmk/odd_pointing_device.c -o /dev/null
+          gcc -std=c11 -Wall -Wextra -Werror -pedantic -DMOUSE_EXTENDED_REPORT -c adapters/qmk/odd_pointing_device.c -o /dev/null
+
+      # Fails if the patch outgrows PATCH_ROM, needs .bss/.data, pulls in a libgcc
+      # __aeabi_* helper, or ddpi_sram_state_t reaches the bootloader magic word.
+      - name: Guard Glorious CM2856 stock patch against core changes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi
+          make -C adapters/glorious-cm2856 clean check
 
       - name: Run OpenMouse TypeScript protocol & engine parity tests
         run: |

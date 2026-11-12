@@ -2,11 +2,15 @@
 upstream/
 artifacts/
 PROGRESS.md
-hardware/glorious-series-one-pro/stock/
-hardware/glorious-series-one-pro/build/
+adapters/stock/
+adapters/build/
 
 # Build outputs
+build/
+twister-out*/
 tests/test_directional_dpi
+tests/gen_vectors
+tests/vectors/*.tmp
 adapters/linux-evdev/odd_evdev_filter
 *.o
 *.elf

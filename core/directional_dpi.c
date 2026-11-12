@@ -48,13 +48,8 @@ static inline uint16_t clamp_q8_8(uint16_t val) {
 }
 
 static inline uint16_t clamp_dpi(uint16_t dpi) {
-    if (dpi < 50u) {
-        return 50u;
-    }
-    if (dpi > 42000u) {
-        return 42000u;
-    }
-    return dpi;
+    /* Upper bound is the full uint16 range (DDPI_DPI_MAX) */
+    return (dpi < DDPI_DPI_MIN) ? (uint16_t)DDPI_DPI_MIN : dpi;
 }
 
 static inline uint32_t abs_i16_to_u32(int16_t v) {
@@ -148,8 +143,9 @@ void ddpi_profile_normalize_cpi_headroom(ddpi_profile_v1_t *profile, uint16_t *o
         return;
     }
 
-    uint32_t boosted_cpi = ((uint32_t)profile->base_dpi * max_eff_q16 + 32768u) >> 16;
-    uint16_t clamped_cpi = clamp_dpi((uint16_t)(boosted_cpi > 42000u ? 42000u : boosted_cpi));
+    /* 64-bit product: base_dpi (<= 65535) * max_eff (<= 16.0x in Q16.16) overflows uint32 */
+    uint64_t boosted_cpi = ((uint64_t)profile->base_dpi * max_eff_q16 + 32768u) >> 16;
+    uint16_t clamped_cpi = clamp_dpi((uint16_t)(boosted_cpi > DDPI_DPI_MAX ? DDPI_DPI_MAX : boosted_cpi));
     if (out_sensor_cpi != NULL) {
         *out_sensor_cpi = clamped_cpi;
     }
@@ -227,7 +223,7 @@ bool ddpi_profile_deserialize(const uint8_t in_buf[DDPI_PROFILE_SERIALIZED_LEN],
 
     uint16_t base_dpi = read_u16_le(&in_buf[4]);
     uint16_t gain     = read_u16_le(&in_buf[6]);
-    if (base_dpi < 50u || base_dpi > 42000u || gain < DDPI_Q8_8_MIN || gain > DDPI_Q8_8_MAX) {
+    if (base_dpi < DDPI_DPI_MIN || gain < DDPI_Q8_8_MIN || gain > DDPI_Q8_8_MAX) {
         return false;
     }
 
@@ -280,6 +276,7 @@ void ddpi_engine_init(ddpi_engine_t *engine, uint16_t base_dpi) {
     engine->dir_y_q16_16      = 0;
     engine->last_octant       = 0u;
     engine->last_scale_q16_16 = DDPI_Q16_16_ONE;
+    engine->last_motion_ms    = 0u;
 }
 
 void ddpi_engine_reset_remainders(ddpi_engine_t *engine) {
@@ -416,11 +413,11 @@ uint32_t ddpi_compute_scale_q16_16(
     if ((profile->flags & DDPI_FLAG_LINEAR_OCTANT_RATIO) == 0u && r > 0u && r < 65536u) {
         /*
          * True circular angular interpolation:
-         * (4/pi)*atan(x) ~= x + 0.2732395 * x * (1 - x)
-         * In Q16.16: 0.2732395 * 65536 = 17907
+         * (4/pi)*atan(x) ~= x + 0.3477 * x * (1 - x)   (max error 0.21 deg over 0..45 deg)
+         * In Q16.16: 0.3477 * 65536 = 22787
          */
         uint64_t one_minus_r = (uint64_t)(65536u - r);
-        uint64_t corr        = (17907ULL * (uint64_t)r * one_minus_r) >> 32;
+        uint64_t corr        = (22787ULL * (uint64_t)r * one_minus_r) >> 32;
         t = r + (uint32_t)corr;
         if (t > 65536u) {
             t = 65536u;
@@ -511,13 +508,10 @@ static void update_direction_estimator(
         return;
     }
 
-    int64_t cur_x = (int64_t)in_dx * 256LL;
-    int64_t cur_y = (int64_t)in_dy * 256LL;
+    int64_t next_x = (int64_t)in_dx * 256LL;
+    int64_t next_y = (int64_t)in_dy * 256LL;
 
-    if (engine->dir_x_q16_16 == 0 && engine->dir_y_q16_16 == 0) {
-        engine->dir_x_q16_16 = (int32_t)cur_x;
-        engine->dir_y_q16_16 = (int32_t)cur_y;
-    } else {
+    if (engine->dir_x_q16_16 != 0 || engine->dir_y_q16_16 != 0) {
         /*
          * Second-order rational Padé decay for exp(-step_l1 / L):
          *   alpha = (2*L) / (2*L + step_l1) in Q16.16
@@ -526,21 +520,25 @@ static void update_direction_estimator(
         uint32_t denom     = two_L + step_l1;
         uint32_t alpha_q16 = (two_L << 16) / denom;
 
-        int64_t next_x = (((int64_t)engine->dir_x_q16_16 * (int64_t)alpha_q16) >> 16) + cur_x;
-        int64_t next_y = (((int64_t)engine->dir_y_q16_16 * (int64_t)alpha_q16) >> 16) + cur_y;
-
-        /* Prevent accumulator overflow on sustained long swipes while preserving exact angle */
-        uint32_t mag_x = abs_i32_to_u32((int32_t)next_x);
-        uint32_t mag_y = abs_i32_to_u32((int32_t)next_y);
-        while (mag_x > 16383u || mag_y > 16383u) {
-            next_x >>= 1;
-            next_y >>= 1;
-            mag_x  >>= 1;
-            mag_y  >>= 1;
-        }
-        engine->dir_x_q16_16 = (int32_t)next_x;
-        engine->dir_y_q16_16 = (int32_t)next_y;
+        next_x += ((int64_t)engine->dir_x_q16_16 * (int64_t)alpha_q16) >> 16;
+        next_y += ((int64_t)engine->dir_y_q16_16 * (int64_t)alpha_q16) >> 16;
     }
+
+    /*
+     * Keep |d| <= 16383 so the int16 estimate below never wraps. This must also run
+     * for the first sample after idle: |in| >= 128 counts would otherwise wrap and
+     * pick the opposite octant's multiplier. Halving both axes preserves the angle.
+     */
+    uint32_t mag_x = abs_i32_to_u32((int32_t)next_x);
+    uint32_t mag_y = abs_i32_to_u32((int32_t)next_y);
+    while (mag_x > 16383u || mag_y > 16383u) {
+        next_x >>= 1;
+        next_y >>= 1;
+        mag_x  >>= 1;
+        mag_y  >>= 1;
+    }
+    engine->dir_x_q16_16 = (int32_t)next_x;
+    engine->dir_y_q16_16 = (int32_t)next_y;
 
     *est_dx = (int16_t)engine->dir_x_q16_16;
     *est_dy = (int16_t)engine->dir_y_q16_16;
@@ -620,6 +618,23 @@ void ddpi_process_delta(
     *out_dy = emit_from_q16_with_remainder(scaled_y, in_dy, &engine->rem_y_q16_16, reset_rem);
 }
 
+void ddpi_process_motion(
+    ddpi_engine_t *engine,
+    int16_t in_dx,
+    int16_t in_dy,
+    uint32_t now_ms,
+    int16_t *out_dx,
+    int16_t *out_dy
+) {
+    if (engine != NULL && (in_dx != 0 || in_dy != 0)) {
+        if ((uint32_t)(now_ms - engine->last_motion_ms) >= ddpi_profile_get_idle_ms(&engine->profile)) {
+            ddpi_engine_notify_idle(engine);
+        }
+        engine->last_motion_ms = now_ms;
+    }
+    ddpi_process_delta(engine, in_dx, in_dy, out_dx, out_dy);
+}
+
 bool ddpi_hid_handle_feature_report(
     ddpi_engine_t *engine,
     const uint8_t req[DDPI_HID_PACKET_LEN],
@@ -667,11 +682,16 @@ bool ddpi_hid_handle_feature_report(
             payload[2] = 0x30u; /* '0' */
             payload[3] = 0x31u; /* '1' */
             payload[4] = DDPI_PROFILE_VERSION;
-            payload[5] = 4u;    /* max_slots */
+            payload[5] = 1u;    /* max_slots: the reference engine holds one profile (slot is ignored) */
             payload[6] = 0u;    /* active_slot */
-            payload[7] = 0x3Fu; /* wired_1000hz | nvs_storage | paw3370_sensor | bootloader_reentry | travel_window | linear_2x2 */
+            /* Only claim what this engine/adapter can actually do; hardware facts
+             * (bit0 wired_1000hz, bit2 paw3370_sensor) are not known to the generic core. */
+            payload[7] = (uint8_t)((on_save_flash != NULL ? 0x02u : 0u) |       /* nvs_storage */
+                                   (on_enter_bootloader != NULL ? 0x08u : 0u) | /* bootloader_reentry */
+                                   0x10u |                                      /* travel_window */
+                                   0x20u);                                      /* linear_2x2 */
             write_u16_le(&payload[8], 50u);
-            write_u16_le(&payload[10], 42000u);
+            write_u16_le(&payload[10], DDPI_DPI_MAX);
             write_u16_le(&payload[12], DDPI_Q8_8_MIN);
             write_u16_le(&payload[14], DDPI_Q8_8_MAX);
             payload[16] = DDPI_DEFAULT_WINDOW_COUNTS;
@@ -696,17 +716,18 @@ bool ddpi_hid_handle_feature_report(
         }
 
         case DDPI_CMD_SAVE_FLASH: {
-            if (on_save_flash != NULL) {
-                if (!on_save_flash(&engine->profile)) {
-                    resp[3] = DDPI_STATUS_ERR_CRC_OR_FMT;
-                }
+            if (on_save_flash == NULL) {
+                resp[3] = DDPI_STATUS_ERR_UNSUPPORTED;
+            } else if (!on_save_flash(&engine->profile)) {
+                resp[3] = DDPI_STATUS_ERR_CRC_OR_FMT;
             }
             ddpi_profile_serialize(&engine->profile, payload);
             break;
         }
 
         case DDPI_CMD_RESET_DEFAULTS: {
-            ddpi_engine_init(engine, 800u);
+            /* Keep the device's own base CPI; only the curve returns to neutral */
+            ddpi_engine_init(engine, engine->profile.base_dpi);
             ddpi_profile_serialize(&engine->profile, payload);
             break;
         }
@@ -748,7 +769,9 @@ bool ddpi_hid_handle_feature_report(
             uint32_t magic_arg = read_u32_le(&req_payload[0]);
             if (magic_arg != DDPI_BOOTLOADER_MAGIC_ARG) {
                 resp[3] = DDPI_STATUS_ERR_RANGE;
-            } else if (on_enter_bootloader != NULL) {
+            } else if (on_enter_bootloader == NULL) {
+                resp[3] = DDPI_STATUS_ERR_UNSUPPORTED;
+            } else {
                 on_enter_bootloader();
             }
             break;

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+
+config ODD_DIRECTIONAL_DPI
+	bool "Open Directional DPI input filter"
+	default y
+	depends on DT_HAS_ODD_DIRECTIONAL_DPI_ENABLED
+	depends on INPUT
+	help
+	  Per-direction (8-octant) mouse sensitivity as a Zephyr input filter
+	  device (compatible "odd,directional-dpi").
+
+config ODD_DIRECTIONAL_DPI_SAVE_DELAY_MS
+	int "Delay before a SAVE_FLASH request is written to settings"
+	default 500
+	depends on ODD_DIRECTIONAL_DPI && SETTINGS
+	help
+	  SAVE_FLASH replies at once; the profile is written this many ms later
+	  (repeated saves within the window are coalesced into one write).

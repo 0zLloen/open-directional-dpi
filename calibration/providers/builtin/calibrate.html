@@ -93,12 +93,13 @@
   <aside>
     <h1>Open Directional Sensitivity Calibration</h1>
     <p>Measures primary-submovement overshoot/undershoot across 8 counter-clockwise directions (<code>odd-sensor-ccw</code>) using raw Pointer Lock input.</p>
+    <p style="color: var(--warn)"><strong>Turn the directional curve off first.</strong> The browser sees motion after the mouse or host filter has applied it, so a calibration through an active curve is relative to it and recalibrating undoes the last one. OpenMouse: calibration bypass (<code>bypassForCalibration()</code>) or disable the curve; Linux: stop <code>odd_evdev_filter</code>; QMK and devicetree curves: flash a flat curve.</p>
     <div class="controls">
-      <label>Base Sensor CPI <input type="number" id="baseCpi" value="800" min="50" max="42000" step="50" /></label>
+      <label>Base Sensor CPI <input type="number" id="baseCpi" value="800" min="50" max="65535" step="50" /></label>
       <label>Trials per Direction <input type="number" id="trialsPerDir" value="8" min="3" max="40" /></label>
       <label>Travel Window L (counts) <input type="number" id="windowCounts" value="16" min="0" max="128" /></label>
       <button class="primary" id="startBtn">Start Calibration (Pointer Lock)</button>
-      <button id="exportBtn">Download odd.profile.v1 JSON</button>
+      <button id="exportBtn">Download profile JSON (OpenMouse import)</button>
     </div>
     <table>
       <thead>
@@ -159,6 +160,28 @@
       });
     }
 
+    // --- profile export (run by integrations/openmouse/test/directional-dpi.test.ts) ---
+    // Canonical open-directional-dpi-v1 JSON. gainsCcw[i] is CCW sector i (0 right,
+    // 1 away-right, 2 away ... 7 toward-right); directionalMultipliers always uses
+    // physical HID keys, so CCW sector i is HID direction (8 - i) % 8. Gains are not
+    // normalized (profile-generation's "none"): keep the sensor at baseCpi.
+    function buildProfileJson(gainsCcw, baseCpi, windowCounts) {
+      const keys = ["E_0", "SE_45", "S_90", "SW_135", "W_180", "NW_225", "N_270", "NE_315"];
+      return {
+        schema: "open-directional-dpi-v1",
+        version: 1,
+        enabled: true,
+        frame: "odd-sensor-ccw",
+        model: "angular-gain",
+        windowCounts,
+        idleResetMs: 50,
+        baseDpi: baseCpi,
+        globalGain: 1,
+        directionalMultipliers: Object.fromEntries(keys.map((k, dir) => [k, gainsCcw[(8 - dir) % 8]])),
+      };
+    }
+    // --- end profile export ---
+
     function updateTableAndJson() {
       const gains = computeGains();
       const tbody = document.getElementById("sectorTable");
@@ -168,30 +191,9 @@
         return `<tr><td>${s.name}</td><td>${r.length}</td><td>${med}</td><td>${gains[i].toFixed(3)}x</td></tr>`;
       }).join("");
 
-      const baseCpi = Number(document.getElementById("baseCpi").value) || 800;
-      const windowCounts = Number(document.getElementById("windowCounts").value) || 16;
-      const maxGain = Math.max(...gains, 1.0);
-      const profile = {
-        schema: "odd.profile.v1",
-        name: "Calibrated Aim Profile",
-        model: "angular-gain",
-        frame: "odd-sensor-ccw",
-        baseCpi,
-        recommendedSensorCpi: Math.round(baseCpi * maxGain),
-        gains,
-        interpolation: "circular-periodic",
-        estimator: {
-          type: "travel-window",
-          lengthCounts: windowCounts,
-          idleResetMs: 50
-        },
-        normalization: "cpi-headroom",
-        calibration: {
-          tool: "odd-calibrate/0.1",
-          date: new Date().toISOString().slice(0, 10),
-          trialsPerDirection: Number(document.getElementById("trialsPerDir").value) || 8
-        }
-      };
+      const baseCpi = Math.min(65535, Math.max(50, Math.round(Number(document.getElementById("baseCpi").value) || 800)));
+      const w = parseInt(document.getElementById("windowCounts").value, 10);
+      const profile = buildProfileJson(gains, baseCpi, Number.isNaN(w) ? 16 : Math.min(128, Math.max(0, w)));
       document.getElementById("profileJson").textContent = JSON.stringify(profile, null, 2);
       return profile;
     }

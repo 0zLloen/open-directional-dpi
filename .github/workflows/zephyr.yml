@@ -1,0 +1,68 @@
+name: Zephyr
+
+on:
+  push:
+    branches: [main]
+    paths: ["adapters/zephyr/**", "core/**", "zephyr/**", ".github/workflows/zephyr.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["adapters/zephyr/**", "core/**", "zephyr/**", ".github/workflows/zephyr.yml"]
+
+jobs:
+  native-sim:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # latest release, and the LTS (input callbacks without user_data)
+        zephyr: [v4.5.0, v3.7.2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: odd
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install host tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build device-tree-compiler
+
+      - name: Fetch Zephyr ${{ matrix.zephyr }} (no modules needed)
+        run: |
+          git clone --depth 1 --branch ${{ matrix.zephyr }} https://github.com/zephyrproject-rtos/zephyr ws/zephyr
+          pip install west cmake \
+            -r ws/zephyr/scripts/requirements-base.txt \
+            -r ws/zephyr/scripts/requirements-build-test.txt \
+            -r ws/zephyr/scripts/requirements-run-test.txt
+          cd ws && west init -l zephyr && west config manifest.project-filter -- '-.*'
+
+      - name: Build and run filter tests (thread + synchronous input mode)
+        env:
+          ZEPHYR_TOOLCHAIN_VARIANT: host
+        run: ws/zephyr/scripts/twister -T odd/adapters/zephyr/tests -p native_sim/native/64 --inline-logs
+
+  zmk:
+    runs-on: ubuntu-24.04
+    # Image and commit as in ZMK main's own CI at the time of writing; bump together.
+    container: zmkfirmware/zmk-build-arm:4.1
+    env:
+      ZMK_REF: 4dd95d7840eb3d5a3f59bb29fbf1ab054715ef85
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: odd
+
+      - name: Fetch ZMK
+        run: |
+          git init -q zmk && cd zmk
+          git fetch -q --depth 1 https://github.com/zmkfirmware/zmk "$ZMK_REF" && git checkout -q FETCH_HEAD
+          west init -l app && west update --narrow -o=--depth=1
+
+      - name: Build nice_nano//zmk (PMW3610 -> odd filter -> zmk,input-listener)
+        working-directory: zmk
+        run: |
+          T="$GITHUB_WORKSPACE/odd/adapters/zephyr/tests/zmk"
+          west build -s app -b nice_nano//zmk -- -DSHIELD=romac \
+            -DZMK_EXTRA_MODULES="$GITHUB_WORKSPACE/odd" \
+            -DEXTRA_DTC_OVERLAY_FILE="$T/odd.overlay" -DEXTRA_CONF_FILE="$T/odd.conf"

@@ -1,0 +1,6 @@
+name: open-directional-dpi
+build:
+  cmake: adapters/zephyr
+  kconfig: adapters/zephyr/Kconfig
+  settings:
+    dts_root: adapters/zephyr

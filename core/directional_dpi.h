@@ -36,9 +36,16 @@ extern "C" {
 /** Fixed-Point Q16.16 Constants (1.00x = 65536 = 0x00010000) */
 #define DDPI_Q16_16_ONE             65536
 
+/** Valid base CPI range (full uint16: covers 45K-class sensors) */
+#define DDPI_DPI_MIN                50u
+#define DDPI_DPI_MAX                65535u
+
 /** Default Travel-Window Estimator Length in Sensor Counts (0.5 mm at 800 CPI) */
 #define DDPI_DEFAULT_WINDOW_COUNTS  16u
 #define DDPI_MAX_WINDOW_COUNTS      128u
+
+/** Default idle gap that resets the direction estimator (profile idle byte == 0) */
+#define DDPI_DEFAULT_IDLE_MS        50u
 
 /** Profile Flags (ddpi_profile_v1_t::flags) */
 #define DDPI_FLAG_ENABLED                    (1u << 0)
@@ -107,7 +114,7 @@ typedef struct {
     uint16_t magic;                             /* +0x00: DDPI_PROFILE_MAGIC (0x4450) */
     uint8_t  version;                           /* +0x02: DDPI_PROFILE_VERSION (0x01) */
     uint8_t  flags;                             /* +0x03: DDPI_FLAG_* bitmask */
-    uint16_t base_dpi;                          /* +0x04: Base sensor CPI/DPI (50..19000) */
+    uint16_t base_dpi;                          /* +0x04: Base sensor CPI/DPI (50..65535) */
     uint16_t global_gain_q8_8;                  /* +0x06: Scalar directional gain (Q8.8) */
     uint16_t multipliers_q8_8[DDPI_NUM_DIRECTIONS]; /* +0x08..0x17: 8 octant multipliers (Q8.8) */
     uint16_t reserved;                          /* +0x18: low8 = window_counts (L), high8 = idle_5ms */
@@ -125,6 +132,7 @@ typedef struct {
     int32_t           dir_y_q16_16;        /* Travel-window smoothed Y direction vector (Q16.16) */
     uint8_t           last_octant;         /* Most recent octant index (0..7) */
     uint32_t          last_scale_q16_16;   /* Most recent effective scale (Q16.16) */
+    uint32_t          last_motion_ms;      /* Timestamp of last non-zero motion (ddpi_process_motion) */
 } ddpi_engine_t;
 
 /**
@@ -146,6 +154,15 @@ static inline void ddpi_profile_set_window_counts(ddpi_profile_v1_t *profile, ui
         window_counts = DDPI_MAX_WINDOW_COUNTS;
     }
     profile->reserved = (uint16_t)((profile->reserved & 0xFF00u) | (uint16_t)window_counts);
+}
+
+/**
+ * Idle gap (ms) after which the direction estimator resets: high byte of `reserved`
+ * in 5 ms units, 0 = DDPI_DEFAULT_IDLE_MS.
+ */
+static inline uint32_t ddpi_profile_get_idle_ms(const ddpi_profile_v1_t *profile) {
+    uint32_t units = (profile == NULL) ? 0u : (uint32_t)(profile->reserved >> 8);
+    return (units == 0u) ? DDPI_DEFAULT_IDLE_MS : units * 5u;
 }
 
 /**
@@ -239,9 +256,26 @@ void ddpi_process_delta(
 );
 
 /**
+ * Same as ddpi_process_delta(), plus the idle-gap reset: if no motion was seen for
+ * ddpi_profile_get_idle_ms() before `now_ms` (any monotonic millisecond clock,
+ * wrap-safe), the direction estimator restarts so a new flick never inherits the
+ * previous one's direction. Adapters with a clock should call this instead.
+ */
+void ddpi_process_motion(
+    ddpi_engine_t *engine,
+    int16_t in_dx,
+    int16_t in_dy,
+    uint32_t now_ms,
+    int16_t *out_dx,
+    int16_t *out_dy
+);
+
+/**
  * Process a 64-byte Open Directional DPI v1 HID Feature report request and
  * populate the 64-byte response buffer.
  * Returns true if the packet matched the Open Directional DPI v1 framing ('D','P' & 0xDF).
+ * Pass NULL for a callback the device cannot do; that command then answers
+ * DDPI_STATUS_ERR_UNSUPPORTED instead of a false OK.
  */
 bool ddpi_hid_handle_feature_report(
     ddpi_engine_t *engine,

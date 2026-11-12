@@ -25,7 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PATCH_DIR = Path(__file__).resolve().parent
 STOCK_DIR = PATCH_DIR.parent / "stock"
 BUILD_DIR = PATCH_DIR.parent / "build"
-TOOLS_DIR = PATCH_DIR.parent / "tools"
+# compx_hex_tool.py lives in https://github.com/0zLloen/mouse-firmware-re (sibling checkout by default)
+TOOLS_DIR = Path(os.environ.get("COMPX_TOOLS", REPO_ROOT.parent / "mouse-firmware-re" / "platforms" / "compx-nrf52" / "tools"))
 CORE_DIR = REPO_ROOT / "core"
 
 ARM_GCC = shutil.which("arm-none-eabi-gcc") or "/tmp/arm-root/usr/bin/arm-none-eabi-gcc"
@@ -149,6 +150,11 @@ def build_patch() -> dict:
     out_bin_path.write_bytes(full_bin)
 
     # Convert to Intel HEX and run compx_hex_tool.py verification
+    if not (TOOLS_DIR / "compx_hex_tool.py").is_file():
+        sys.exit(
+            f"compx_hex_tool.py not found in {TOOLS_DIR}: clone "
+            "https://github.com/0zLloen/mouse-firmware-re next to this repo or set COMPX_TOOLS"
+        )
     sys.path.insert(0, str(TOOLS_DIR))
     import compx_hex_tool
 

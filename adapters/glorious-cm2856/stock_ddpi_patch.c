@@ -64,6 +64,10 @@ typedef struct {
     ddpi_engine_t engine;
 } ddpi_sram_state_t;
 
+/* Engine state must never reach the Compx bootloader magic word at 0x2003FFFC */
+_Static_assert(DDPI_SRAM_STATE_ADDR + sizeof(ddpi_sram_state_t) <= 0x2003FFFCu,
+               "ddpi_sram_state_t overlaps COMPX_BL_MAGIC_SRAM_ADDR");
+
 static inline ddpi_sram_state_t *get_ddpi_state(void) {
     return (ddpi_sram_state_t *)DDPI_SRAM_STATE_ADDR;
 }
@@ -203,6 +207,9 @@ void ddpi_paw3370_burst_wrapper(void) {
         int16_t out_dx = raw_dx;
         int16_t out_dy = raw_dy;
 
+        /* No idle reset (ddpi_process_motion): no verified stock millisecond tick to
+         * read yet. A profile with travel window L > 0 lets a new flick's first ~L
+         * counts lean toward the previous direction; L = 0 has no such carry-over. */
         ddpi_process_delta(&st->engine, raw_dx, raw_dy, &out_dx, &out_dy);
 
         STOCK_SENSOR_STATE_DX = out_dx;

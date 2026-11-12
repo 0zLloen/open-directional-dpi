@@ -5,51 +5,65 @@
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
+  clampDpi,
+  computeDirectionalScaleQ16_16,
   computePolarCurve360,
   createDefaultProfileV1,
+  DDPI_DPI_MAX,
+  DDPI_DPI_MIN,
+  DDPI_FLAG_BYPASS_FOR_CALIBRATION,
   DDPI_FLAG_ENABLED,
+  DDPI_FLAG_FRAME_SENSOR_CCW,
+  DDPI_FLAG_KEEP_REMAINDER_ON_REVERSE,
+  DDPI_FLAG_MODEL_LINEAR_2X2,
+  DDPI_Q16_16_ONE,
   DdpiDirection,
+  type DdpiProfileV1,
   deserializeProfileV1,
+  type EightMultipliers,
   exportProfileJson,
   floatToQ8_8,
   importProfileJson,
+  isProfileIdentity,
   OpenMouseDirectionalDpiClient,
   SERIES_ONE_PRO_WIRED_BL_PID,
   serializeProfileV1,
+  type WebHidFeatureTransport,
 } from "../src/directional-dpi.ts";
 import { MockGloriousSeriesOneProHidDevice } from "../src/mock-hid.ts";
 
 async function runTests(): Promise<void> {
   console.log("=== OpenMouse — Open Directional DPI v1 Integration Tests ===");
 
-  /* Test 1: Stock Glorious Firmware Detection (Zero Experimental HID Commands Sent) */
+  /* Test 1: Stock Glorious firmware gets only the stock version query, no ODD packet */
   {
     const stockMock = new MockGloriousSeriesOneProHidDevice("stock-glorious");
     const client = new OpenMouseDirectionalDpiClient(stockMock);
     const caps = await client.detectCapabilities();
     assert.equal(caps.firmwareKind, "stock-glorious");
     assert.equal(caps.protocolVersion, 0);
-    /* Verify zero custom HID packets were sent to stock firmware */
-    assert.equal(stockMock.featurePacketsReceived, 0);
-    console.log("  [PASS] 01. Stock firmware detected passively with 0 vendor HID packets sent");
+    assert.equal(stockMock.featurePacketsReceived, 1);
+    assert.equal(stockMock.oddPacketsReceived, 0);
+    console.log("  [PASS] 01. Stock firmware detected with 0 Open Directional DPI packets sent");
   }
 
-  /* Test 2: Custom Open Directional DPI v1 Capability Discovery */
+  /* Test 2: Patched Glorious (stock descriptors) found by its "DP01" version stamp */
   {
     const customMock = new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1");
     const client = new OpenMouseDirectionalDpiClient(customMock);
     const caps = await client.detectCapabilities();
     assert.equal(caps.firmwareKind, "open-directional-dpi-v1");
     assert.equal(caps.protocolVersion, 1);
-    assert.equal(caps.maxSlots, 4);
-    assert.equal(caps.wired1000Hz, true);
+    assert.equal(caps.maxSlots, 1);
+    assert.equal(caps.wired1000Hz, false);
     assert.equal(caps.nvsStorage, true);
-    assert.equal(caps.paw3370Sensor, true);
+    assert.equal(caps.paw3370Sensor, false);
     assert.equal(caps.bootloaderReentry, true);
     assert.equal(caps.minDpi, 50);
-    assert.equal(caps.maxDpi, 19000);
-    console.log("  [PASS] 02. Custom Open Directional DPI v1 capability discovery over WebHID");
+    assert.equal(caps.maxDpi, DDPI_DPI_MAX);
+    console.log("  [PASS] 02. Patched Glorious detected by version stamp, capabilities as the core reports");
   }
 
   /* Test 3: Profile Read, Write, Enable/Disable, NVS Save, and Reboot Persistence */
@@ -80,8 +94,10 @@ async function runTests(): Promise<void> {
 
     /* Save to NVS flash, modify RAM, then simulate power-cycle reboot */
     await client.saveToFlash(0);
-    await client.resetDefaults(0);
-    assert.equal((await client.getProfile(0)).baseDpi, 800);
+    const reset = await client.resetDefaults(0);
+    assert.equal(reset.baseDpi, 1600); // RESET_DEFAULTS keeps base_dpi
+    assert.deepEqual([reset.flags, reset.multipliersQ8_8[DdpiDirection.S]], [0, 256]);
+    assert.deepEqual(await client.getProfile(0), reset);
 
     customMock.simulatePowerCycleReboot();
     const afterReboot = await client.getProfile(0);
@@ -90,7 +106,7 @@ async function runTests(): Promise<void> {
     console.log("  [PASS] 03. Profile read/write, verified readback, and NVS flash persistence");
   }
 
-  /* Test 4: Bit-Exact Parity Between TypeScript Mock Firmware and C Reference Vectors */
+  /* Test 4: Mock firmware SIMULATE_DELTA over WebHID (C engine parity is test 07) */
   {
     const customMock = new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1");
     const client = new OpenMouseDirectionalDpiClient(customMock);
@@ -100,7 +116,7 @@ async function runTests(): Promise<void> {
     prof.multipliersQ8_8 = [256, 320, 384, 320, 256, 224, 192, 224];
     await client.setProfile(prof, 0);
 
-    /* Compare against exact C reference vectors from tests/test_directional_dpi.c */
+    /* Hand-computed: each axis/diagonal gets its own multiplier, truncated toward zero */
     const expectedVectors = [
       { dx: 100, dy: 0, outDx: 100, outDy: 0 },
       { dx: 71, dy: 71, outDx: 88, outDy: 88 },
@@ -119,7 +135,20 @@ async function runTests(): Promise<void> {
       assert.equal(sim.outDx, vec.outDx);
       assert.equal(sim.outDy, vec.outDy);
     }
-    console.log("  [PASS] 04. Bit-exact parity between TypeScript engine and C reference vectors");
+
+    /* Like the C engine (§6.4): remainder kept on reversal, excess carried past the clamp */
+    const g15 = createDefaultProfileV1(800);
+    g15.flags = DDPI_FLAG_ENABLED;
+    g15.globalGainQ8_8 = 384;
+    await client.setProfile(g15, 0);
+    await client.setEnabled(false, 0);
+    await client.setEnabled(true, 0);
+    const outs: number[] = [];
+    for (const dx of [1, -1, -1, 30000, 1]) {
+      outs.push((await client.simulateDelta(dx, 0)).outDx);
+    }
+    assert.deepEqual(outs, [1, -1, -1, 32767, 12234]);
+    console.log("  [PASS] 04. Mock firmware SIMULATE_DELTA round trip over WebHID");
   }
 
   /* Test 5: JSON Profile Import/Export & 360-Degree Polar Curve Generation */
@@ -151,7 +180,275 @@ async function runTests(): Promise<void> {
     console.log("  [PASS] 06. Safe bootloader re-entry (0x2003FFFC = 0xA55AA55A -> 258a:2103)");
   }
 
-  console.log("\nAll 6/6 OpenMouse integration test suites passed.");
+  const hex = (p: DdpiProfileV1): string =>
+    Buffer.from(serializeProfileV1(p)).toString("hex");
+
+  /* Test 7: Bit-exact parity with the C engine (tests/vectors, `make -C tests vectors`) */
+  {
+    const suite = JSON.parse(
+      readFileSync(
+        new URL("../../../tests/vectors/scale_vectors.json", import.meta.url),
+        "utf8"
+      )
+    ) as { profiles: Array<{ name: string; bytes: string; vectors: number[][] }> };
+    let checked = 0;
+    for (const p of suite.profiles) {
+      const prof = deserializeProfileV1(Uint8Array.from(Buffer.from(p.bytes, "hex")));
+      assert.equal(hex(prof), p.bytes, `${p.name}: TS serializer differs from C`);
+      for (const [dx, dy, scaleQ16_16, octant] of p.vectors) {
+        assert.deepEqual(
+          computeDirectionalScaleQ16_16(prof, dx!, dy!),
+          { scaleQ16_16, octant },
+          `${p.name} (${dx}, ${dy})`
+        );
+        checked++;
+      }
+    }
+    assert.ok(checked >= 2000, `only ${checked} C vectors found`);
+    console.log(`  [PASS] 07. Bit-exact parity with ${checked} C engine vectors`);
+  }
+
+  /* Test 8: odd-sensor-ccw profiles map to the same physical directions as HID-CW */
+  {
+    const ccw = createDefaultProfileV1(800);
+    ccw.flags = DDPI_FLAG_ENABLED | DDPI_FLAG_FRAME_SENSOR_CCW;
+    ccw.multipliersQ8_8 = [256, 288, 384, 320, 224, 192, 128, 160]; // CCW: 2 = away 1.5x, 6 = toward 0.5x
+    assert.equal(computeDirectionalScaleQ16_16(ccw, 0, -100).scaleQ16_16, 98304);
+    assert.equal(computeDirectionalScaleQ16_16(ccw, 0, 100).scaleQ16_16, 32768);
+    const cw: DdpiProfileV1 = {
+      ...ccw,
+      flags: DDPI_FLAG_ENABLED,
+      multipliersQ8_8: ccw.multipliersQ8_8.map(
+        (_, i) => ccw.multipliersQ8_8[(8 - i) & 7]!
+      ) as EightMultipliers,
+    };
+    assert.deepEqual(computePolarCurve360(cw), computePolarCurve360(ccw));
+    console.log("  [PASS] 08. CCW-frame profiles scale the same physical directions as HID-CW");
+  }
+
+  /* Test 9: Calibration bypass is an exact identity, like the C engine */
+  {
+    const p = createDefaultProfileV1(800);
+    p.flags = DDPI_FLAG_ENABLED | DDPI_FLAG_BYPASS_FOR_CALIBRATION;
+    p.multipliersQ8_8[DdpiDirection.E] = 512;
+    assert.equal(isProfileIdentity(p), true);
+    assert.deepEqual(computeDirectionalScaleQ16_16(p, 100, 0), {
+      scaleQ16_16: DDPI_Q16_16_ONE,
+      octant: 0,
+    });
+    p.flags = DDPI_FLAG_ENABLED;
+    assert.equal(computeDirectionalScaleQ16_16(p, 100, 0).scaleQ16_16, 2 * DDPI_Q16_16_ONE);
+    console.log("  [PASS] 09. Calibration bypass flag yields 1.00x");
+  }
+
+  /* Test 10: 45000 CPI survives bytes and JSON; DPI range is 50..65535 like C */
+  {
+    const p = createDefaultProfileV1(45000);
+    assert.equal(p.baseDpi, 45000);
+    assert.equal(deserializeProfileV1(serializeProfileV1(p)).baseDpi, 45000);
+    assert.equal(importProfileJson(exportProfileJson(p)).baseDpi, 45000);
+    assert.equal(clampDpi(70000), DDPI_DPI_MAX);
+    assert.equal(clampDpi(10), DDPI_DPI_MIN);
+    assert.deepEqual([DDPI_DPI_MIN, DDPI_DPI_MAX], [50, 65535]);
+    console.log("  [PASS] 10. 45000 CPI profile round-trips through bytes and JSON");
+  }
+
+  /* Test 11: JSON round trip keeps all 28 bytes (except the transient bypass bit) */
+  {
+    let cases = 0;
+    for (let flags = 0; flags < 128; flags++) {
+      for (const windowCounts of [0, 1, 16, 128]) {
+        for (const idleUnits of [0, 1, 10, 255]) {
+          const p = createDefaultProfileV1(1600);
+          p.flags = flags;
+          p.globalGainQ8_8 = 300;
+          p.multipliersQ8_8 = [16, 200, 256, 300, 384, 512, 1000, 1024];
+          p.reserved = (idleUnits << 8) | windowCounts;
+          assert.equal(
+            hex(importProfileJson(exportProfileJson(p))),
+            hex({ ...p, flags: flags & ~DDPI_FLAG_BYPASS_FOR_CALIBRATION }),
+            `flags=${flags} window=${windowCounts} idleUnits=${idleUnits}`
+          );
+          cases++;
+        }
+      }
+    }
+    console.log(`  [PASS] 11. JSON export/import is byte-exact over ${cases} flag/window/idle combinations`);
+  }
+
+  /* Test 12: Files from the original exporter (no frame/model/window fields) import as before */
+  {
+    const legacy = `{
+  "schema": "open-directional-dpi-v1",
+  "version": 1,
+  "enabled": true,
+  "keepRemainderOnReverse": true,
+  "linearOctantRatio": false,
+  "baseDpi": 1200,
+  "globalGain": 1.25,
+  "directionalMultipliers": {
+    "E_0": 1.5, "SE_45": 1.25, "S_90": 1.5, "SW_135": 1,
+    "W_180": 1, "NW_225": 0.875, "N_270": 0.75, "NE_315": 0.875
+  }
+}`;
+    const p = importProfileJson(legacy);
+    assert.equal(p.flags, DDPI_FLAG_ENABLED | DDPI_FLAG_KEEP_REMAINDER_ON_REVERSE);
+    assert.equal(p.reserved, 0);
+    assert.equal(p.baseDpi, 1200);
+    assert.equal(p.globalGainQ8_8, 320);
+    assert.deepEqual(p.multipliersQ8_8, [384, 320, 384, 256, 256, 224, 192, 224]);
+    console.log("  [PASS] 12. Legacy JSON profiles import unchanged");
+  }
+
+  /* Test 13: Malformed or out-of-range JSON is rejected with a clear error */
+  {
+    const valid = JSON.parse(exportProfileJson(createDefaultProfileV1(800)));
+    const dm = valid.directionalMultipliers;
+    const bad: Array<[string, RegExp]> = [
+      ["not json", /not valid JSON/],
+      ["[]", /must be an object/],
+      ["null", /must be an object/],
+      [JSON.stringify({ ...valid, schema: "odd.profile.v1" }), /schema/],
+      [JSON.stringify({ ...valid, enabled: "yes" }), /"enabled"/],
+      [JSON.stringify({ ...valid, baseDpi: "800" }), /"baseDpi"/],
+      [JSON.stringify({ ...valid, baseDpi: 70000 }), /"baseDpi"/],
+      [JSON.stringify({ ...valid, baseDpi: 800.5 }), /"baseDpi"/],
+      [JSON.stringify({ ...valid, baseDpi: undefined }), /"baseDpi"/],
+      [JSON.stringify({ ...valid, frame: "ccw" }), /"frame"/],
+      [JSON.stringify({ ...valid, model: 2 }), /"model"/],
+      [JSON.stringify({ ...valid, windowCounts: 129 }), /"windowCounts"/],
+      [JSON.stringify({ ...valid, idleResetMs: 52 }), /"idleResetMs"/],
+      [JSON.stringify({ ...valid, idleResetMs: 1280 }), /"idleResetMs"/],
+      [JSON.stringify({ ...valid, globalGain: 5 }), /"globalGain"/],
+      [JSON.stringify({ ...valid, directionalMultipliers: { ...dm, N_270: 0.01 } }), /N_270/],
+      [JSON.stringify({ ...valid, directionalMultipliers: { ...dm, SE_45: undefined } }), /SE_45/],
+      [JSON.stringify({ ...valid, directionalMultipliers: [1, 1, 1, 1, 1, 1, 1, 1] }), /"directionalMultipliers"/],
+    ];
+    for (const [json, err] of bad) {
+      assert.throws(() => importProfileJson(json), err, json);
+    }
+    console.log(`  [PASS] 13. ${bad.length} malformed JSON profiles rejected`);
+  }
+
+  /* Test 14: calibrate.html export imports with each CCW gain on its physical direction */
+  {
+    const html = readFileSync(
+      new URL("../../../calibration/providers/builtin/calibrate.html", import.meta.url),
+      "utf8"
+    );
+    const src = /\/\/ --- profile export[^\n]*\n([\s\S]*?)\/\/ --- end profile export ---/.exec(html)?.[1];
+    assert.ok(src, "buildProfileJson block not found in calibrate.html");
+    const buildProfileJson = new Function(`${src}\nreturn buildProfileJson;`)() as (
+      gainsCcw: number[],
+      baseCpi: number,
+      windowCounts: number
+    ) => { directionalMultipliers: Record<string, number> };
+
+    const gainsCcw = [1.0, 1.05, 1.2, 0.95, 0.9, 0.85, 0.8, 1.1]; // 0 right, 1 away-right, 2 away .. 7 toward-right
+    const doc = buildProfileJson(gainsCcw, 1600, 16);
+    assert.equal(doc.directionalMultipliers.N_270, gainsCcw[2]); // away
+    assert.equal(doc.directionalMultipliers.S_90, gainsCcw[6]); // toward
+    const p = importProfileJson(JSON.stringify(doc));
+    assert.equal(p.flags, DDPI_FLAG_ENABLED | DDPI_FLAG_FRAME_SENSOR_CCW);
+    assert.equal(p.baseDpi, 1600);
+    assert.equal(p.globalGainQ8_8, 256);
+    assert.equal(p.reserved, (10 << 8) | 16); // idle 50 ms, window 16
+    /* Unnormalized, so the sensor stays at baseDpi: no CPI advice that would apply the peak gain twice */
+    assert.equal((doc as Record<string, unknown>).recommendedSensorCpi, undefined);
+    /* Same array profile-generation flashes with normalization "none" */
+    assert.deepEqual(p.multipliersQ8_8, gainsCcw.map(floatToQ8_8));
+    /* CCW sector i as an HID motion (+X right, -Y away) gets exactly gain i */
+    const ccwMotions = [[100, 0], [100, -100], [0, -100], [-100, -100], [-100, 0], [-100, 100], [0, 100], [100, 100]];
+    ccwMotions.forEach(([dx, dy], i) => {
+      assert.equal(
+        computeDirectionalScaleQ16_16(p, dx!, dy!).scaleQ16_16,
+        floatToQ8_8(gainsCcw[i]!) << 8,
+        `CCW sector ${i}`
+      );
+    });
+    console.log("  [PASS] 14. calibrate.html export maps CCW gains to physical directions");
+  }
+
+  /* Test 15: Other devices need the "[OpenDDPIv1]" product string; bcdDevice is ignored */
+  {
+    const dev = new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1");
+    Object.assign(dev, { vendorId: 0x1d50, productId: 0x615e, productName: "Corne", bcdDevice: 0x0401 });
+    assert.equal((await new OpenMouseDirectionalDpiClient(dev).detectCapabilities()).firmwareKind, "unsupported");
+    assert.equal(dev.featurePacketsReceived, 0);
+
+    dev.productName = "Zephyr mouse [OpenDDPIv1]";
+    const caps = await new OpenMouseDirectionalDpiClient(dev).detectCapabilities();
+    assert.equal(caps.firmwareKind, "open-directional-dpi-v1");
+    assert.equal(dev.featurePacketsReceived, 1); // GET_CAPABILITIES only
+    console.log("  [PASS] 15. Non-Glorious devices: product-string marker required, bcdDevice ignored");
+  }
+
+  /* Test 16: linear-2x2 polar curve follows the C engine's matrix, not the angular blend */
+  {
+    const p = createDefaultProfileV1(800);
+    p.flags = DDPI_FLAG_ENABLED | DDPI_FLAG_MODEL_LINEAR_2X2;
+    p.multipliersQ8_8[DdpiDirection.NE] = 384; // h = (1.5 - 1.0) / 2 = 0.25
+    const curve = computePolarCurve360(p);
+    /* (707,-707) -> (883.75,-883.75); (-707,-707) -> 0.75x; (1000,0) -> (1000,-250) */
+    assert.deepEqual(
+      [curve[315]!.multiplier, curve[225]!.multiplier, curve[0]!.multiplier],
+      [1.25, 0.75, 1.0308]
+    );
+    console.log("  [PASS] 16. linear-2x2 polar curve matches the 2x2 engine model");
+  }
+
+  /* Test 17: a device that answers from its main loop (Glorious patch, 2.4 GHz receiver):
+   * GET_REPORT returns the previous answer until the request has been processed */
+  {
+    const inner = new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1");
+    let ready = new Uint8Array(64);
+    let pending: Uint8Array | undefined;
+    let gets = 0;
+    let staleGets = 2;
+    const lagging: WebHidFeatureTransport = {
+      vendorId: inner.vendorId,
+      productId: inner.productId,
+      productName: inner.productName,
+      bcdDevice: inner.bcdDevice,
+      async sendFeatureReport(_id, data) {
+        pending = data.slice();
+        gets = 0;
+      },
+      async receiveFeatureReport(id) {
+        if (pending && ++gets > staleGets) {
+          await inner.sendFeatureReport(id, pending);
+          ready = new Uint8Array((await inner.receiveFeatureReport(id)).buffer);
+          pending = undefined;
+        }
+        return new DataView(ready.slice().buffer);
+      },
+    };
+    const client = new OpenMouseDirectionalDpiClient(lagging);
+    assert.equal((await client.detectCapabilities()).firmwareKind, "open-directional-dpi-v1");
+    const p = createDefaultProfileV1(800);
+    p.flags = DDPI_FLAG_ENABLED;
+    p.multipliersQ8_8[DdpiDirection.S] = 384;
+    assert.equal((await client.setProfile(p)).multipliersQ8_8[DdpiDirection.S], 384);
+
+    /* Calibration bypass: exact 1.00x, ENABLED kept; setEnabled(true) ends it */
+    assert.equal(await client.bypassForCalibration(), true);
+    assert.equal((await client.simulateDelta(0, 100)).outDy, 100);
+    await client.setEnabled(true);
+    assert.equal((await client.simulateDelta(0, 100)).outDy, 150);
+
+    assert.equal((await client.saveToFlash()).multipliersQ8_8[DdpiDirection.S], 384);
+    assert.equal(pending, undefined, "saveToFlash resolved before the device ran SAVE_FLASH");
+    assert.equal((await client.resetDefaults()).multipliersQ8_8[DdpiDirection.S], 256);
+
+    /* Never answered: an error instead of the previous answer */
+    staleGets = Infinity;
+    await assert.rejects(client.getProfile(), /No answer to opcode 0x2/);
+    /* ...except ENTER_BOOTLOADER, which normally resets without answering */
+    await client.enterBootloader();
+    console.log("  [PASS] 17. Late answers are waited for and matched by seq/opcode; calibration bypass");
+  }
+
+  console.log("\nAll 17/17 OpenMouse integration test suites passed.");
 }
 
 runTests().catch((err) => {

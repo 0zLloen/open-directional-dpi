@@ -366,6 +366,105 @@ static void test_linear_2x2_and_calibration_bypass(void) {
     assert(ox == 100 && oy == -100);
 }
 
+/* 13. Regression: first sample after idle with |d| >= 128 must not wrap the int16 estimate */
+static void test_large_first_sample_after_idle(void) {
+    const int16_t firsts[] = {128, 200, 1000, 32767, -128, -32768};
+    for (size_t i = 0; i < sizeof(firsts) / sizeof(firsts[0]); ++i) {
+        ddpi_engine_t eng;
+        ddpi_engine_init(&eng, 800u);
+        eng.profile.flags = DDPI_FLAG_ENABLED;
+        eng.profile.multipliers_q8_8[DDPI_DIR_W] = 512; /* Left 2.00x, Right 1.00x */
+        ddpi_profile_set_window_counts(&eng.profile, 16u);
+        ddpi_engine_set_profile(&eng, &eng.profile);
+
+        int16_t ox = 0, oy = 0;
+        ddpi_process_delta(&eng, firsts[i], 0, &ox, &oy);
+        int32_t expect = (firsts[i] > 0) ? firsts[i] : 2 * (int32_t)firsts[i];
+        if (expect < -32767) expect = -32767;
+        assert(ox == expect);
+        assert(oy == 0);
+        assert(eng.last_octant == (firsts[i] > 0 ? 0u : 3u));
+    }
+}
+
+/* 14. ddpi_process_motion: idle gap restarts the direction estimator (default and custom timeout) */
+static void test_process_motion_idle_reset(void) {
+    for (int gap_case = 0; gap_case < 3; ++gap_case) {
+        ddpi_engine_t eng;
+        ddpi_engine_init(&eng, 800u);
+        eng.profile.flags = DDPI_FLAG_ENABLED;
+        eng.profile.multipliers_q8_8[DDPI_DIR_N] = 128; /* Up 0.50x, Right 1.00x */
+        ddpi_profile_set_window_counts(&eng.profile, 16u);
+        if (gap_case == 2) {
+            eng.profile.reserved = (uint16_t)(eng.profile.reserved | (40u << 8)); /* 200 ms idle */
+        }
+        ddpi_engine_set_profile(&eng, &eng.profile);
+
+        int16_t ox = 0, oy = 0;
+        uint32_t t = 1000u;
+        for (int i = 0; i < 20; ++i) {
+            ddpi_process_motion(&eng, 20, 0, t++, &ox, &oy); /* Sweep right */
+        }
+        uint32_t gap = (gap_case == 0) ? 5u : 100u;
+        ddpi_process_motion(&eng, 0, -4, t + gap, &ox, &oy); /* Then move up */
+        if (gap_case == 1) {
+            assert(oy == -2); /* 100 ms >= 50 ms default: fresh estimate, pure N = 0.50x */
+        } else {
+            assert(oy != -2); /* 5 ms gap, or 100 ms < 200 ms custom: still inherits the sweep */
+        }
+    }
+}
+
+/* 15. Commands the device cannot perform answer UNSUPPORTED instead of a false OK */
+static void test_hid_null_callbacks_unsupported(void) {
+    ddpi_engine_t eng;
+    ddpi_engine_init(&eng, 800u);
+    const uint8_t opcodes[] = {DDPI_CMD_SAVE_FLASH, DDPI_CMD_ENTER_BOOTLOADER};
+    for (size_t i = 0; i < sizeof(opcodes); ++i) {
+        uint8_t req[DDPI_HID_PACKET_LEN];
+        uint8_t resp[DDPI_HID_PACKET_LEN];
+        memset(req, 0, sizeof(req));
+        req[0] = 0x44u;
+        req[1] = 0x50u;
+        req[2] = DDPI_PROFILE_VERSION;
+        req[5] = DDPI_HID_NAMESPACE;
+        req[6] = opcodes[i];
+        req[8] = 0x53u; /* "BLRS" little-endian */
+        req[9] = 0x52u;
+        req[10] = 0x4Cu;
+        req[11] = 0x42u;
+        uint16_t crc = ddpi_crc16_ccitt(req, 62u);
+        req[62] = (uint8_t)(crc & 0xFFu);
+        req[63] = (uint8_t)(crc >> 8);
+        assert(ddpi_hid_handle_feature_report(&eng, req, resp, NULL, NULL));
+        assert(resp[3] == DDPI_STATUS_ERR_UNSUPPORTED);
+    }
+}
+
+/* 16. High-CPI sensors (45K class) round-trip, and headroom math does not overflow */
+static void test_high_cpi_range(void) {
+    ddpi_profile_v1_t p;
+    ddpi_profile_init_default(&p, 45000u);
+    p.flags = DDPI_FLAG_ENABLED;
+    uint8_t buf[DDPI_PROFILE_SERIALIZED_LEN];
+    ddpi_profile_serialize(&p, buf);
+    ddpi_profile_v1_t out;
+    assert(ddpi_profile_deserialize(buf, &out));
+    assert(out.base_dpi == 45000u);
+
+    uint16_t cpi = 0;
+    p.multipliers_q8_8[DDPI_DIR_E] = 307; /* ~1.2x -> 54000 */
+    ddpi_profile_normalize_cpi_headroom(&p, &cpi);
+    assert(cpi >= 53900u && cpi <= 54100u);
+
+    ddpi_profile_init_default(&p, 60000u);
+    p.flags = DDPI_FLAG_ENABLED;
+    p.global_gain_q8_8 = 1024; /* 4x * 4x = 16x would overflow uint32 math */
+    p.multipliers_q8_8[DDPI_DIR_E] = 1024;
+    ddpi_profile_normalize_cpi_headroom(&p, &cpi);
+    assert(cpi == DDPI_DPI_MAX);
+}
+
 int main(void) {
     printf("=== Open Directional DPI v1 — Portable C Reference Engine Tests ===\n");
     RUN_TEST(test_neutral_identity_passthrough);
@@ -380,6 +479,10 @@ int main(void) {
     RUN_TEST(test_ccw_frame_conversion);
     RUN_TEST(test_cpi_headroom_normalization);
     RUN_TEST(test_linear_2x2_and_calibration_bypass);
+    RUN_TEST(test_large_first_sample_after_idle);
+    RUN_TEST(test_process_motion_idle_reset);
+    RUN_TEST(test_hid_null_callbacks_unsupported);
+    RUN_TEST(test_high_cpi_range);
 
     printf("\nAll %d/%d tests passed.\n", g_tests_passed, g_tests_run);
     return (g_tests_passed == g_tests_run) ? 0 : 1;
