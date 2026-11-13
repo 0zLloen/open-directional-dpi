@@ -34,7 +34,7 @@ Integrates the portable C reference engine ([`core/directional_dpi.c`](../../cor
 
 The direction estimator restarts after the profile's idle gap (default 50 ms) using `timer_read32()`, so each flick starts from its own direction.
 
-`node --experimental-strip-types calibration/cli.ts format profile.json --format qmk` prints the `keyboard_post_init_user()` lines for a calibrated profile.
+`node --experimental-strip-types calibration/cli.ts format profile.json --format qmk` prints the `keyboard_post_init_user()` lines for a calibrated profile. To load profiles from a host instead of reflashing, see [HID protocol over raw HID](#hid-protocol-over-raw-hid-via-vial).
 
 ## Single DPI stage
 
@@ -51,11 +51,43 @@ The adapter feeds `pointing_device_get_cpi()` to the engine on every report, so 
 
 Without `MOUSE_EXTENDED_REPORT`, QMK reports are 8-bit: drivers already clamp the sensor delta to ±127 (`CONSTRAIN_HID_XY`) before `pointing_device_task_user()` runs, and the adapter saturates the scaled output to ±127 too, so fast motion with gains above 1.00x loses counts. Enable `MOUSE_EXTENDED_REPORT`, or keep all gains ≤ 1.00x and raise the sensor CPI instead (`ddpi_profile_normalize_cpi_headroom()` computes it).
 
+## HID protocol over raw HID (VIA, Vial)
+
+With raw HID the board speaks the same protocol as the other routes (`GET_PROFILE`, `SET_PROFILE`, `SIMULATE_DELTA`, `SET_ENABLED`, `SAVE_FLASH`, ...), so a host can load a calibrated profile without reflashing. QMK has no vendor Feature report, so the 64-byte packets travel over QMK's raw HID interface (usage page `0xFF60`, usage `0x61`) in 32-byte frames that start with `0xDF` ([`spec/hid-protocol-v1.md`](../../spec/hid-protocol-v1.md) §6). Inferred from the QMK 0.34.8 and vial-qmk sources (2026-11-13); not yet built in QMK or run on a device.
+
+1. `rules.mk`: raw HID, and the hook file. `VIA_ENABLE = yes` already turns raw HID on (Vial keymaps set it too).
+   ```makefile
+   RAW_ENABLE = yes   # or VIA_ENABLE = yes
+   SRC += odd/adapters/qmk/odd_raw_hid.c
+   ```
+   `odd_raw_hid.c` defines the hook that the build's raw HID stack calls: `raw_hid_receive_kb()` with Vial, `via_command_kb()` with QMK's VIA, `raw_hid_receive()` with raw HID alone. If the keyboard or keymap already defines that hook (some keyboards define `via_command_kb()`), leave the file out and call `odd_qmk_raw_hid()` first from the existing hook, as `odd_raw_hid.c` does:
+   ```c
+   bool odd_qmk_raw_hid(uint8_t *data, uint8_t length); /* true: handled, reply left in data */
+   ```
+2. Optional, `config.h`: keep the profile across power cycles. `SAVE_FLASH` then writes it to bytes 0..27 of QMK's user datablock (EEPROM), and `odd_qmk_init()` loads it at boot. Without it `SAVE_FLASH` answers "unsupported" and the profile lives in RAM until the next reset.
+   ```c
+   #define EECONFIG_USER_DATA_SIZE 28 /* more if the keymap stores its own data after byte 27 */
+   ```
+   A profile set in `keyboard_post_init_user()` after `odd_qmk_init()` replaces the saved one at every boot, so drop those lines once the host loads and saves the profile.
+
+What the board does:
+- Frames whose byte 0 is not `0xDF` go to VIA or Vial as before. The probe that finds the adapter is harmless on boards without it: VIA and Vial answer `0xFF` to the first frame, and the host stops (spec §6.3).
+- `ENTER_BOOTLOADER` answers "unsupported": QMK's VIA has no bootloader command and Vial allows one only after an unlock, so the adapter does not add one.
+- `GET_CAPABILITIES` reports the sensor DPI (`pointing_device_get_cpi()`) and the clock (`timer_read32()`) that `pointing_device_task_odd()` last saw.
+- QMK runs raw HID and the pointing device task in the same main loop, so no lock is needed.
+
+Hosts:
+- `integrations/openmouse` (WebHID, Chrome or Edge): open the device with the filter `QMK_RAW_HID_FILTER` (`{ usagePage: 0xff60, usage: 0x61 }`) and pass it to `OpenMouseDirectionalDpiClient`; `detectCapabilities()` sends the probe. Tested against a mock board only.
+- `tools/odd_profile.py` (Linux hidraw, or hidapi on any OS): finds the `0xFF60`/`0x61` interface and probes it only when no mouse is found or `--device` names it. Tested against fake boards only.
+- `calibrate.html` (**Send to mouse**) does not speak raw HID yet: it uses the Feature report only.
+- Close the VIA or Vial app while configuring: it reads replies from the same interface.
+
 ## Compile check without QMK
 
-CI compiles it against its stand-in types and against QMK 0.34.8's own `report.h`, `pointing_device.h` and `timer.h` (headers only). Not yet built in a QMK keyboard or run on a QMK device; the keymap snippet above is not compiled in CI.
+CI compiles the adapter against its stand-in types and against QMK 0.34.8's own `report.h`, `pointing_device.h`, `timer.h`, `eeconfig.h` and `raw_hid.h` (headers only), with and without `RAW_ENABLE`, and `odd_raw_hid.c` for raw HID alone, VIA and Vial. `make -C tests test` runs the raw HID framing, the probe answer and `SAVE_FLASH` on the host (`tests/test_qmk_raw_hid.c`). Not yet built in a QMK keyboard or run on a QMK device; the keymap snippet above is not compiled in CI.
 
 ```sh
 gcc -std=c11 -Wall -Wextra -Werror -pedantic -c odd_pointing_device.c -o /dev/null
 gcc -std=c11 -Wall -Wextra -Werror -pedantic -DMOUSE_EXTENDED_REPORT -c odd_pointing_device.c -o /dev/null
+gcc -std=c11 -Wall -Wextra -Werror -pedantic -DRAW_ENABLE -c odd_pointing_device.c -o /dev/null
 ```

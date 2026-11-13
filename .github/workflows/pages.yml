@@ -1,0 +1,48 @@
+name: Pages
+
+# Publishes calibrate.html (self-contained, no other files) at https://0zlloen.github.io/open-directional-dpi/
+on:
+  push:
+    branches: [main]
+    paths: ["calibration/providers/builtin/calibrate.html", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a newer push waits instead of cancelling a deployment halfway
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # main is not protected and this runs beside ci.yml, so test the page here before it goes live
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Test the page's WebHID client and export
+        run: node --experimental-strip-types --test calibration/tests/builtin-webhid.test.ts
+
+      - name: Stage the page only
+        run: |
+          mkdir _site
+          cp calibration/providers/builtin/calibrate.html _site/index.html
+          cp calibration/providers/builtin/calibrate.html _site/calibrate.html
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

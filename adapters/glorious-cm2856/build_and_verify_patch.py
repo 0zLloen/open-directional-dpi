@@ -19,15 +19,20 @@ Build and verify the open-directional-dpi patch for the Glorious Series One Pro
    6 SET_PROFILE + SAVE_FLASH (an identical second save does not erase), 7 sensor hooks,
    8 request relayed through the 2.4 GHz receiver, 9 2.4 GHz reply capped at 64 bytes,
    10 idle reset of the direction estimator after 50 burst calls (1 per ms tick).
-6. Only then writes adapters/build/CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.bin and .hex.
+6. Only then writes adapters/build/CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.bin and .hex, and
+   adapters/build/OpenDDPIv1-patch.json for apply_patch.py (users without the ARM toolchain). The
+   patch file holds only the bytes that differ from the stock image: the hook instructions and the
+   appended patch code, never stock bytes (asserted). It is the one build output that may be published.
 
 Exits non-zero if the toolchain, compx_hex_tool.py, unicorn or the stock image is missing,
-or if any check fails. Any old OpenDDPIv1 .bin/.hex is deleted first, so a failed run leaves
+or if any check fails. Any old OpenDDPIv1 .bin/.hex/.json is deleted first, so a failed run leaves
 no image to flash. The checks are assert statements: python3 -O is refused.
 """
 
 import argparse
 import hashlib
+import itertools
+import json
 import os
 import shutil
 import struct
@@ -54,6 +59,7 @@ STOCK_LEN = 0x0001CC90 - APP_BASE  # 93,328 bytes
 # Decoded official CM2856_Mouse_USB_v1.00.00_20220810.hex (sha256 2c5c1672...); also the first
 # 93,328 bytes of a VerifyByAddress dump of a retail mouse on stock v1.0.0.0 (checked 2026-11-13).
 STOCK_SHA256 = "e50510e0eb213e69d62a088d6f5b792fb88b0f3dc56d3c9c21dd0ca8b6e892be"
+PATCH_FORMAT = {"format": "open-directional-dpi-patch", "version": 1}
 
 
 def import_compx_hex_tool():
@@ -174,6 +180,7 @@ def build_patch(stock_bin: bytes) -> dict:
         full_bin += bytearray(b"\xFF" * (32 - (len(full_bin) % 32)))
 
     # Verify and patch the 4 BL hooks
+    sites = []  # (address, length) of every stock byte replaced; the patch file may hold only these
     hooks = [
         (0x0000E874, 0x0000D4A0, symbols["ddpi_boot_init_wrapper"], "boot_init_hook"),
         (0x0000E8CE, 0x000151AC, symbols["ddpi_usb_protocol_wrapper"], "usb_proto_hook"),
@@ -190,6 +197,7 @@ def build_patch(stock_bin: bytes) -> dict:
         encoded = encode_thumb2_bl(call_addr, new_target)
         assert decode_thumb2_bl(encoded, call_addr) == new_target
         full_bin[file_off : file_off + 4] = encoded
+        sites.append((call_addr, 4))
         print(f"        Patched {label:<20} @ 0x{call_addr:08X}: 0x{orig_target:08X} -> 0x{new_target:08X} ({encoded.hex()})")
 
     # Cap the stock 2.4 GHz reply length at 64 bytes (see ddpi_rf_reply_len_clamp): replace the two
@@ -211,6 +219,7 @@ def build_patch(stock_bin: bytes) -> dict:
         replacement = new_bytes(addr)
         assert len(replacement) == len(expected)
         full_bin[file_off : file_off + len(expected)] = replacement
+        sites.append((addr, len(expected)))
         print(f"        Patched {label:<20} @ 0x{addr:08X}: {expected_hex} -> {replacement.hex()}")
 
     # Convert to Intel HEX and run compx_hex_tool.py verification (nothing is written yet)
@@ -223,7 +232,29 @@ def build_patch(stock_bin: bytes) -> dict:
         f"0x{APP_BASE:08X}..0x{APP_BASE + len(full_bin) - 1:08X}, SHA256={res['sha256'][:16]}...)"
     )
 
-    return {"full_bin": bytes(full_bin), "hex_text": hex_text, "symbols": symbols}
+    return {"full_bin": bytes(full_bin), "hex_text": hex_text, "symbols": symbols, "sites": sites}
+
+
+def make_patch_file(stock: bytes, image: bytes, sites: list) -> dict:
+    """apply_patch.py input: the bytes where image differs from stock padded with 0xFF to its size, as
+    {addr, hex} runs. Each run must lie inside a hook site or the appended region, so the file carries
+    no stock bytes (a hook site's runs are the project's instruction encodings)."""
+    padded = stock.ljust(len(image), b"\xFF")
+    ranges = []
+    for changed, run in itertools.groupby(range(len(image)), lambda i: image[i] != padded[i]):
+        if changed:
+            run = list(run)
+            start, end = APP_BASE + run[0], APP_BASE + run[-1] + 1
+            assert run[0] >= len(stock) or any(a <= start and end <= a + n for a, n in sites), (
+                f"changed bytes 0x{start:08X}..0x{end:08X} outside the hook sites and the appended region"
+            )
+            ranges.append({"addr": f"0x{start:08X}", "hex": image[run[0] : run[-1] + 1].hex()})
+    return {
+        **PATCH_FORMAT,
+        "stock": {"sha256": hashlib.sha256(stock).hexdigest(), "size": len(stock)},
+        "ranges": ranges,
+        "result": {"sha256": hashlib.sha256(image).hexdigest(), "size": len(image)},
+    }
 
 
 def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
@@ -562,7 +593,20 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
             burst(0x00)
         out = burst(0x80, 0, -8)
         assert out == (0, expected_dy), f"{idle_calls} idle calls: North -8 -> {out}, expected (0, {expected_dy})"
-    print("  [PASS] Test 10: Idle reset after 50 burst calls (North -8 -> -4 after 49 idle calls; -8 after 48, still East)")
+
+    def caps_clock() -> int:
+        mu.mem_write(0x20004F28, make_ddpi_req(0x01))
+        mu.mem_write(0x200032D4, b"\x01")
+        call_bl_site_at(0x0000E8CE)
+        r = bytes(mu.mem_read(0x20006000, 64))
+        assert r[3] == 0xA1 and r[15] & 0x80, "GET_CAPABILITIES must report the clock (flag bit 7)"
+        return struct.unpack_from("<I", r, 28)[0]
+
+    c0 = caps_clock()
+    for _ in range(25):
+        burst(0x00)
+    assert caps_clock() - c0 == 25, "the reported clock must count burst calls"
+    print("  [PASS] Test 10: Idle reset after 50 burst calls (North -8 -> -4 after 49 idle calls; -8 after 48, still East; GET_CAPABILITIES clock = burst calls)")
 
     print("[UNICORN] All 10 instruction-level Cortex-M4F hardware emulation tests PASSED!")
 
@@ -587,15 +631,19 @@ def main() -> None:
     # A failed run must not leave a flashable image, old or new: write only after every check passed
     out_bin_path = BUILD_DIR / "CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.bin"
     out_hex_path = BUILD_DIR / "CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.hex"
-    for path in (out_bin_path, out_hex_path):
+    out_json_path = BUILD_DIR / "OpenDDPIv1-patch.json"
+    for path in (out_bin_path, out_hex_path, out_json_path):
         path.unlink(missing_ok=True)
-    info = build_patch(load_stock_image(args.stock_hex))
+    stock = load_stock_image(args.stock_hex)
+    info = build_patch(stock)
     run_unicorn_verification(info["full_bin"], info["symbols"])
-    for path, data in ((out_bin_path, info["full_bin"]), (out_hex_path, info["hex_text"].encode("ascii"))):
+    patch_json = json.dumps(make_patch_file(stock, info["full_bin"], info["sites"]), indent=1) + "\n"
+    for path, data in ((out_bin_path, info["full_bin"]), (out_hex_path, info["hex_text"].encode("ascii")),
+                       (out_json_path, patch_json.encode("ascii"))):
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_bytes(data)
         os.replace(tmp, path)  # never a half-written .hex under the final name
-    print(f"[BUILD] Wrote {out_bin_path} and {out_hex_path.name}")
+    print(f"[BUILD] Wrote {out_bin_path}, {out_hex_path.name} and {out_json_path.name} (patch bytes only, for apply_patch.py)")
 
 
 if __name__ == "__main__":

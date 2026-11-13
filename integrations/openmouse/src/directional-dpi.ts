@@ -3,7 +3,8 @@
  *
  * Compatible with the Glorious Forge Series One Pro running the stock-firmware patch, by
  * cable (258a:2018) or through its 2.4 GHz receiver (258a:2031, spec/hid-protocol-v1.md §2.3),
- * and any mouse firmware implementing Open Directional DPI v1 (spec/directional-dpi-v1.md).
+ * any mouse firmware implementing Open Directional DPI v1 (spec/directional-dpi-v1.md), and
+ * QMK keyboards with adapters/qmk over their raw HID interface (spec/hid-protocol-v1.md §6).
  * Verified: the same packets from tools/odd_profile.py on a retail mouse, both routes
  * (2026-11-13). Not yet run over WebHID on hardware; tested against mock-hid.ts only.
  *
@@ -141,7 +142,8 @@ export interface DdpiProfileJsonExport {
 }
 
 export interface DdpiDeviceCapabilities {
-  /** "unsupported": not a Glorious Series One Pro and no "[OpenDDPIv1]" product string */
+  /** "unsupported": not a Glorious Series One Pro, no "[OpenDDPIv1]" product string, and
+   *  not a QMK raw HID interface that answers the probe (spec/hid-protocol-v1.md §6.3) */
   firmwareKind: "stock-glorious" | "unsupported" | "open-directional-dpi-v1";
   protocolVersion: number;
   maxSlots: number;
@@ -156,6 +158,8 @@ export interface DdpiDeviceCapabilities {
   maxMultiplierQ8_8: number;
   /** Current sensor DPI as reported by the firmware (0 = unknown; then onlyAtBaseDpi has no effect) */
   sensorDpi: number;
+  /** The firmware's millisecond clock (the one its idle reset uses), or null if not reported */
+  clockMs: number | null;
 }
 
 export interface WebHidFeatureTransport {
@@ -164,6 +168,23 @@ export interface WebHidFeatureTransport {
   readonly productName: string;
   sendFeatureReport(reportId: number, data: Uint8Array): Promise<void>;
   receiveFeatureReport(reportId: number): Promise<DataView>;
+}
+
+/** WebHID requestDevice() filter for QMK's raw HID interface (spec/hid-protocol-v1.md §6.1) */
+export const QMK_RAW_HID_FILTER = { usagePage: 0xff60, usage: 0x61 } as const;
+
+/**
+ * A WebHID HIDDevice opened on a QMK raw HID interface: 32-byte Output and Input
+ * reports, no Report ID. The client carries each 64-byte packet in six frames (§6.2).
+ */
+export interface WebHidRawTransport {
+  readonly vendorId: number;
+  readonly productId: number;
+  readonly productName: string;
+  readonly collections: readonly { usagePage?: number; usage?: number }[];
+  sendReport(reportId: number, data: Uint8Array): Promise<void>;
+  addEventListener(type: "inputreport", listener: (event: { data: DataView }) => void): void;
+  removeEventListener(type: "inputreport", listener: (event: { data: DataView }) => void): void;
 }
 
 /**
@@ -615,6 +636,67 @@ export function computePolarCurve360(
 const ANSWER_DEADLINE_MS = 2000;
 const ANSWER_POLL_MS = 10;
 
+/** Only this interface is probed (§6.3 rule 1); any other device keeps the Feature report path */
+function isQmkRawHid(t: WebHidFeatureTransport | WebHidRawTransport): t is WebHidRawTransport {
+  return (
+    "collections" in t &&
+    t.collections.some(
+      (c) => c.usagePage === QMK_RAW_HID_FILTER.usagePage && c.usage === QMK_RAW_HID_FILTER.usage
+    )
+  );
+}
+
+/**
+ * The 64-byte packet over QMK raw HID (spec/hid-protocol-v1.md §6.2), shaped like the
+ * Feature report transport: a SET_REPORT is write frames 0..2, a GET_REPORT is read
+ * frames 0x80..0x82. Lock step: each frame waits for its reply, the next Input report
+ * with the same chunk byte and 0xDF; 0xFF (VIA / Vial: unknown command) or no reply
+ * within the deadline fails. Reports of other programs (the VIA app) are skipped.
+ */
+function qmkRawHidTransport(dev: WebHidRawTransport): WebHidFeatureTransport {
+  const frame = (chunk: number, data: Uint8Array): Promise<Uint8Array> =>
+    new Promise((resolve, reject) => {
+      const out = new Uint8Array(32);
+      out[0] = DDPI_HID_NAMESPACE;
+      out[1] = chunk;
+      out.set(data, 2);
+      const finish = (err: unknown, reply?: Uint8Array): void => {
+        clearTimeout(timer);
+        dev.removeEventListener("inputreport", onReport);
+        if (reply) resolve(reply);
+        else reject(err);
+      };
+      const onReport = ({ data: dv }: { data: DataView }): void => {
+        const r = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+        if (r[1] !== chunk || (r[0] !== DDPI_HID_NAMESPACE && r[0] !== 0xff)) return;
+        if (r[0] === 0xff) finish(new Error("Not an Open Directional DPI device: raw HID frame answered 0xFF"));
+        else finish(undefined, r.slice());
+      };
+      const timer = setTimeout(
+        () => finish(new Error(`No raw HID reply within ${ANSWER_DEADLINE_MS} ms`)),
+        ANSWER_DEADLINE_MS
+      );
+      dev.addEventListener("inputreport", onReport);
+      dev.sendReport(0x00, out).catch(finish);
+    });
+  return {
+    vendorId: dev.vendorId,
+    productId: dev.productId,
+    productName: dev.productName,
+    async sendFeatureReport(_reportId, pkt) {
+      for (let i = 0; i < 3; i++) await frame(i, pkt.subarray(30 * i, 30 * i + 30));
+    },
+    async receiveFeatureReport() {
+      const pkt = new Uint8Array(DDPI_HID_PACKET_LENGTH);
+      for (let i = 0; i < 3; i++) {
+        const r = await frame(0x80 | i, new Uint8Array(0));
+        pkt.set(r.subarray(2, i === 2 ? 6 : 32), 30 * i); // chunk 2: packet bytes 60..63
+      }
+      return new DataView(pkt.buffer);
+    },
+  };
+}
+
 /**
  * Of the Glorious devices a host can open, the cable (258a:2018) wins over the
  * 2.4 GHz receiver (258a:2031) when both are present, as in tools/odd_profile.py.
@@ -639,9 +721,13 @@ export class OpenMouseDirectionalDpiClient {
    *  before running any handler, so a request can never trigger a stock command. */
   private seq = 5;
   private readonly transport: WebHidFeatureTransport;
+  /** QMK raw HID interface (spec/hid-protocol-v1.md §6): framed packets, identified by the probe */
+  private readonly qmkRawHid: boolean;
 
-  constructor(transport: WebHidFeatureTransport) {
-    this.transport = transport;
+  /** A WebHID HIDDevice: the Feature report, or QMK's raw HID interface (QMK_RAW_HID_FILTER) */
+  constructor(transport: WebHidFeatureTransport | WebHidRawTransport) {
+    this.qmkRawHid = isQmkRawHid(transport);
+    this.transport = isQmkRawHid(transport) ? qmkRawHidTransport(transport) : transport;
   }
 
   /** The Glorious 2.4 GHz receiver relays requests to the mouse (spec/hid-protocol-v1.md §2.3) */
@@ -659,9 +745,12 @@ export class OpenMouseDirectionalDpiClient {
    * identified itself first: product string "[OpenDDPIv1]" (any device), or for
    * the Glorious Series One Pro IDs only, the "DP01" stamp the stock-firmware
    * patch adds to the stock firmware-version answer (through the receiver: the
-   * relayed query and the stamp at 12..15, §2.3).
+   * relayed query and the stamp at 12..15, §2.3). A QMK raw HID interface is
+   * identified by the GET_CAPABILITIES probe itself (§6.3): only a valid "DP01"
+   * answer counts; a 0xFF reply, silence or echoed frames mean "unsupported".
    * Otherwise returns "stock-glorious" / "unsupported".
-   * Throws if the receiver cannot reach the mouse.
+   * Throws if the receiver cannot reach the mouse, or on a WebHID error
+   * (DOMException: device not opened, unplugged).
    */
   async detectCapabilities(): Promise<DdpiDeviceCapabilities> {
     const t = this.transport;
@@ -669,11 +758,27 @@ export class OpenMouseDirectionalDpiClient {
       t.vendorId === GLORIOUS_VID &&
       (t.productId === SERIES_ONE_PRO_WIRED_PID ||
         t.productId === SERIES_ONE_PRO_WIRELESS_PID);
-    const speaksOdd =
+    const magic = (r: Uint8Array): string => String.fromCharCode(...r.subarray(8, 12));
+    let resp: Uint8Array | undefined;
+    if (this.qmkRawHid) {
+      resp = await this.sendCommand(DdpiHidOpcode.GET_CAPABILITIES, 0, new Uint8Array(0)).catch(
+        (e: unknown) => {
+          if (e instanceof DOMException) throw e; // WebHID: not opened, unplugged
+          return undefined;
+        }
+      );
+      if (resp !== undefined && magic(resp) !== "DP01") resp = undefined;
+    } else if (
       t.productName.includes("[OpenDDPIv1]") ||
-      (glorious && (await this.gloriousVersionHasPatchStamp()));
+      (glorious && (await this.gloriousVersionHasPatchStamp()))
+    ) {
+      resp = await this.sendCommand(DdpiHidOpcode.GET_CAPABILITIES, 0, new Uint8Array(0));
+      if (magic(resp) !== "DP01") {
+        throw new Error(`Unexpected capability signature: ${magic(resp)}`);
+      }
+    }
 
-    if (!speaksOdd) {
+    if (resp === undefined) {
       return {
         firmwareKind: glorious ? "stock-glorious" : "unsupported",
         protocolVersion: 0,
@@ -688,23 +793,10 @@ export class OpenMouseDirectionalDpiClient {
         minMultiplierQ8_8: DDPI_Q8_8_ONE,
         maxMultiplierQ8_8: DDPI_Q8_8_ONE,
         sensorDpi: 0,
+        clockMs: null,
       };
     }
 
-    const resp = await this.sendCommand(
-      DdpiHidOpcode.GET_CAPABILITIES,
-      0,
-      new Uint8Array(0)
-    );
-    const magic = String.fromCharCode(
-      resp[8]!,
-      resp[9]!,
-      resp[10]!,
-      resp[11]!
-    );
-    if (magic !== "DP01") {
-      throw new Error(`Unexpected capability signature: ${magic}`);
-    }
     const dv = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
     const hwFlags = resp[15]!;
     return {
@@ -721,6 +813,7 @@ export class OpenMouseDirectionalDpiClient {
       minMultiplierQ8_8: dv.getUint16(20, true),
       maxMultiplierQ8_8: dv.getUint16(22, true),
       sensorDpi: dv.getUint16(26, true),
+      clockMs: (hwFlags & 0x80) !== 0 ? dv.getUint32(28, true) : null,
     };
   }
 

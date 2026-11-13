@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Load, save and export Open Directional DPI profiles on a mouse (Linux hidraw, standard library only).
+Load, save and export Open Directional DPI profiles on a mouse (Linux: standard library only; Windows, macOS: hidapi).
 
   info                     device, firmware, current DPI and the active profile
   load PROFILE.json [--save]  send a profile (calibrate.html / OpenMouse JSON); --save keeps it after power-off
@@ -12,11 +12,18 @@ Load, save and export Open Directional DPI profiles on a mouse (Linux hidraw, st
 Devices: a Glorious Series One Pro running the open-directional-dpi patch, by cable (258a:2018) or
 through its 2.4 GHz receiver (258a:2031), detected by the DP01 stamp in its firmware-version reply
 (nothing else is sent to stock firmware); or any device whose USB product string contains
-"[OpenDDPIv1]". The cable is used when both are connected; --device /dev/hidrawN picks one of these
-(any other node is refused). Without --save, a loaded profile lasts until the mouse powers off.
-Needs read/write access to the mouse's hidraw node: install mouse-firmware-re
-devices/glorious-series-one-pro/udev/70-glorious-series-one-pro.rules (cable, receiver and bootloader),
-or run as root.
+"[OpenDDPIv1]"; or, only when none of these is found or --device picks it, a QMK board with the
+open-directional-dpi adapter, identified on its raw HID interface (usage page 0xFF60, usage 0x61) by the
+GET_CAPABILITIES probe of spec/hid-protocol-v1.md 6.3 (a VIA or Vial board without the adapter answers 0xFF to
+the first frame and gets nothing else; close the VIA and Vial apps first, they read the same interface).
+The cable is used when both are connected; --device picks one of these (any other node is refused).
+Without --save, a loaded profile lasts until the mouse powers off. On Linux it needs read/write access to the
+hidraw node: install mouse-firmware-re devices/glorious-series-one-pro/udev/70-glorious-series-one-pro.rules
+(cable, receiver and bootloader), or run as root.
+
+Backends (--backend): hidraw (Linux default, standard library: feature-report ioctls, and write()/read() for QMK
+raw HID) and hidapi (Windows and macOS default; pip install hidapi). On Linux --backend hidapi loads cython-hidapi's
+hidraw module, never its libusb "hid" module, which detaches the kernel driver from the interface while it is open.
 
 Through the receiver, requests carry the Compx relay envelope: body[2] = 0x02 (target: mouse) and
 body[3] = 0x3A (forward 64 bytes); the CRC still covers the canonical packet (body[2] = 1, body[3] = 0).
@@ -28,9 +35,9 @@ importProfileJson); integrations/openmouse/test checks both directions against i
 """
 
 import argparse
-import fcntl
 import json
 import os
+import select
 import struct
 import sys
 import time
@@ -44,6 +51,8 @@ KEYS = ["E_0", "SE_45", "S_90", "SW_135", "W_180", "NW_225", "N_270", "NE_315"] 
 GET_CAPS, GET_PROFILE, SET_PROFILE, SAVE_FLASH, RESET_DEFAULTS = 0x01, 0x02, 0x03, 0x04, 0x05
 STATUS = {0xA1: "ok", 0xA2: "CRC or format error", 0xA3: "unsupported", 0xA4: "out of range"}
 GLORIOUS_WIRED, GLORIOUS_RECEIVER = (0x258A, 0x2018), (0x258A, 0x2031)
+FEATURE_USAGE, QMK_USAGE = (0xFFFF, 0x0000), (0xFF60, 0x61)  # spec 1 (Glorious interface 2), spec 6.1
+QMK_RDESC = bytes.fromhex("0660ff0961a101")  # QMK raw HID report descriptor start (spec 6.1)
 SYSFS = Path("/sys/class/hidraw")
 UDEV_HINT = ("install mouse-firmware-re devices/glorious-series-one-pro/udev/70-glorious-series-one-pro.rules "
              "(cable, receiver and bootloader), or run as root.")
@@ -154,17 +163,82 @@ def _ioc(nr: int) -> int:
     return (3 << 30) | (65 << 16) | (ord("H") << 8) | nr  # HIDIOCSFEATURE(65) / HIDIOCGFEATURE(65)
 
 
+class Hidraw:
+    """Linux hidraw node, standard library. Buffers carry report ID 0 in byte 0, except read(), which returns the
+    unnumbered report alone."""
+
+    def __init__(self, path: str):
+        import fcntl  # Linux only
+
+        self.ioctl, self.fd = fcntl.ioctl, os.open(path, os.O_RDWR)
+
+    def set_feature(self, buf: bytes):
+        self.ioctl(self.fd, _ioc(0x06), bytearray(buf))
+
+    def get_feature(self) -> bytes:
+        buf = bytearray(65)
+        self.ioctl(self.fd, _ioc(0x07), buf)
+        return bytes(buf[1:])
+
+    def write(self, buf: bytes):
+        os.write(self.fd, buf)
+
+    def read(self, timeout: float) -> bytes:
+        return os.read(self.fd, 64) if select.select([self.fd], [], [], timeout)[0] else b""
+
+
+class Hidapi:
+    """cython-hidapi device (pip install hidapi). hidapi keeps the report ID in byte 0 of feature reports both ways:
+    65 bytes go out, and get_feature_report(0, 65) returns 65 with byte 0 = 0x00, which is dropped. Windows needs
+    those full 65-byte buffers (report length + 1, even for an unnumbered report; hidapi documentation, not yet tried
+    on Windows), so the same sizes are used on every platform. read() returns the input report without that byte."""
+
+    def __init__(self, hid, path: str):
+        self.dev = hid.device()
+        try:
+            self.dev.open_path(path.encode())
+        except OSError:  # cython-hidapi raises "open failed"; the reason (access denied, ...) is in error()
+            raise OSError(self.dev.error() or "open failed") from None
+
+    def _check(self, n: int):
+        if n < 0:  # cython-hidapi returns -1 from write() and send_feature_report() instead of raising
+            raise OSError(self.dev.error() or "write failed")
+
+    def set_feature(self, buf: bytes):
+        self._check(self.dev.send_feature_report(buf))
+
+    def get_feature(self) -> bytes:
+        return bytes(self.dev.get_feature_report(0, 65)[1:]).ljust(64, b"\x00")  # 64 bytes, as hidraw
+
+    def write(self, buf: bytes):
+        self._check(self.dev.write(buf))
+
+    def read(self, timeout: float) -> bytes:
+        return bytes(self.dev.read(64, max(1, int(timeout * 1000))))
+
+
+def load_hidapi():
+    try:
+        if sys.platform.startswith("linux"):
+            import hidraw as hid  # cython-hidapi's hidraw backend; its "hid" module is libusb (see module docstring)
+        else:
+            import hid
+    except ImportError:
+        sys.exit("--backend hidapi needs cython-hidapi: pip install hidapi")
+    if not hasattr(hid, "device"):
+        sys.exit(f"{hid.__file__}: this hid module is not cython-hidapi. pip uninstall hid, then pip install hidapi.")
+    return hid
+
+
 class Device:
-    def __init__(self, path: str, relay: bool = False):
-        self.path, self.relay, self.fd, self.seq = path, relay, os.open(path, os.O_RDWR), int(time.time()) % 251
+    def __init__(self, path: str, io, relay: bool = False, raw: bool = False):
+        self.path, self.io, self.relay, self.raw, self.seq = path, io, relay, raw, int(time.time()) % 251
 
     def set(self, body: bytes):
-        fcntl.ioctl(self.fd, _ioc(0x06), bytearray(b"\x00" + body.ljust(64, b"\x00")))
+        self.io.set_feature(b"\x00" + body.ljust(64, b"\x00"))
 
     def get(self) -> bytes:
-        buf = bytearray(65)
-        fcntl.ioctl(self.fd, _ioc(0x07), buf)
-        return bytes(buf[1:])
+        return self.io.get_feature()
 
     def has_dp01_stamp(self) -> bool:
         """Stock Glorious firmware-version query. The patch stamps 'DP01' at bytes 16..19 and, since it can
@@ -190,65 +264,138 @@ class Device:
             sys.exit(f"{self.path}: the receiver cannot reach the mouse (switched off, asleep or out of range).")
         return None
 
+    def frame(self, chunk: int, data: bytes, deadline: float) -> bytes:
+        """QMK raw HID (spec 6.2): send one 32-byte frame and return the board's reply to it, the next input report
+        with the same byte 1 and byte 0 = 0xDF. Byte 0 = 0xFF means the board does not know the command."""
+        self.io.write(b"\x00" + bytes([NAMESPACE, chunk]) + bytes(data).ljust(30, b"\x00"))
+        while (left := deadline - time.monotonic()) > 0:
+            r = self.io.read(left)
+            if r[1:2] == bytes([chunk]) and r[0] in (NAMESPACE, 0xFF):  # other reports belong to another program
+                if r[0] == 0xFF:
+                    raise RuntimeError("unsupported (raw HID answered 0xFF: no open-directional-dpi adapter)")
+                return r
+        raise RuntimeError(f"no reply to raw HID frame 0x{chunk:02X}")
+
     def command(self, opcode: int, payload: bytes = b"") -> bytes:
         self.seq = 5 + (self.seq - 4) % 251  # 5..255: stock firmware never runs a handler for these
         req = bytearray(64)
         req[0:3], req[4], req[5], req[6] = b"DP\x01", self.seq, NAMESPACE, opcode
         req[8:8 + len(payload)] = payload
         struct.pack_into("<H", req, 62, crc16(req[:62]))
-        if self.relay:
-            req[2], req[3] = 0x02, 0x3A  # relay envelope, outside the CRC (see module docstring)
-        self.set(bytes(req))
-        r = self.poll(lambda r: r[0:2] == b"DP" and r[4] == self.seq and r[6] == opcode  # only our own answer
-                      and struct.unpack_from("<H", r, 62)[0] == crc16(r[:62]))
+
+        def ok(r):  # only our own answer (spec 3)
+            return (len(r) == 64 and r[0:2] == b"DP" and 0xA1 <= r[3] <= 0xA4 and r[4] == self.seq and r[6] == opcode
+                    and struct.unpack_from("<H", r, 62)[0] == crc16(r[:62]))
+
+        if self.raw:  # write chunks 0..2, then read chunks 0..2, one reply each (spec 6.2)
+            deadline = time.monotonic() + 2.0
+            for i in range(3):
+                self.frame(i, req[30 * i:30 * i + 30], deadline)
+            r = b"".join(self.frame(0x80 | i, b"", deadline)[2:32] for i in range(3))[:64]
+            r = r if ok(r) else None
+        else:
+            if self.relay:
+                req[2], req[3] = 0x02, 0x3A  # relay envelope, outside the CRC (see module docstring)
+            self.set(bytes(req))
+            r = self.poll(ok)
         if r is None:
             raise RuntimeError(f"no answer to opcode 0x{opcode:02X}")
         if r[3] != 0xA1:
             raise RuntimeError(f"opcode 0x{opcode:02X} failed: {STATUS.get(r[3], hex(r[3]))}")
         return r[8:]
 
+    def answers_probe(self) -> bool:
+        """QMK raw HID identification (spec 6.3): GET_CAPABILITIES answered with status 0xA1 and "DP01"."""
+        try:
+            return self.command(GET_CAPS)[:4] == b"DP01"
+        except RuntimeError:
+            return False
 
-def find_device(explicit: str | None) -> Device:
-    """Only nodes that identify themselves (spec/hid-protocol-v1.md 2.2): a vendor usage page plus the Glorious IDs
-    (then the DP01 stamp) or "[OpenDDPIv1]" in the product string. --device only picks among them."""
-    found = []
+
+def hidraw_nodes():
+    """(path, (vid, pid), product string, kind) per hidraw node. kind: "qmk" for QMK's raw HID descriptor, "feature"
+    for any other descriptor that starts with a vendor usage page 0xFFxx, else None."""
     for h in sorted(SYSFS.glob("hidraw*")):
-        if explicit and h.name != Path(explicit).name:
-            continue
         uevent = dict(l.split("=", 1) for l in (h / "device/uevent").read_text().splitlines() if "=" in l)
         _bus, vid, pid = (int(x, 16) for x in uevent.get("HID_ID", "0:0:0").split(":"))
         rdesc = (h / "device/report_descriptor").read_bytes()
-        vendor_page = len(rdesc) >= 3 and rdesc[0] == 0x06 and rdesc[2] == 0xFF  # usage page 0xFFxx
-        if vendor_page and ((vid, pid) in (GLORIOUS_WIRED, GLORIOUS_RECEIVER) or "[OpenDDPIv1]" in uevent.get("HID_NAME", "")):
-            found.append((f"/dev/{h.name}", (vid, pid)))
-    wired = [f for f in found if f[1] != GLORIOUS_RECEIVER]
-    if not found and explicit:
+        vendor_page = len(rdesc) >= 3 and rdesc[0] == 0x06 and rdesc[2] == 0xFF
+        kind = "qmk" if rdesc.startswith(QMK_RDESC) else "feature" if vendor_page else None
+        yield f"/dev/{h.name}", (vid, pid), uevent.get("HID_NAME", ""), kind
+
+
+def hidapi_nodes(hid):
+    """The same from hidapi, which lists each top-level collection. "feature" is usage page 0xFFFF, usage 0 (spec 1):
+    on the Glorious mouse that is interface 2, the node hidraw picks. Its interface 1 also has vendor collections
+    (0xFFA0 and 0xFFFF, usage 1), which Windows lists as devices of their own."""
+    for d in hid.enumerate():
+        usage = (d["usage_page"], d["usage"])
+        kind = "qmk" if usage == QMK_USAGE else "feature" if usage == FEATURE_USAGE else None
+        yield d["path"].decode(), (d["vendor_id"], d["product_id"]), d["product_string"] or "", kind
+
+
+def find_device(explicit: str | None, backend: str = "hidraw") -> Device:
+    """Only nodes that identify themselves (spec/hid-protocol-v1.md 2.2): a vendor usage page plus the Glorious IDs
+    (then the DP01 stamp) or "[OpenDDPIv1]" in the product string; QMK raw HID interfaces only by the probe of 6.3,
+    and only when there is no such node. --device only picks among them."""
+    if backend == "hidapi":
+        hid = load_hidapi()
+        nodes, open_io = hidapi_nodes(hid), lambda path: Hidapi(hid, path)
+    elif sys.platform.startswith("linux"):
+        nodes, open_io = hidraw_nodes(), Hidraw
+    else:
+        sys.exit("hidraw is Linux only: use --backend hidapi (pip install hidapi).")
+    nodes = [n for n in nodes if not explicit or n[0] in (explicit, "/dev/" + explicit)]
+    found = [n for n in nodes if n[3] == "feature" and (n[1] in (GLORIOUS_WIRED, GLORIOUS_RECEIVER) or "[OpenDDPIv1]" in n[2])]
+    qmk = [n[0] for n in nodes if n[3] == "qmk"]  # probed only if found is empty
+    wired = [n for n in found if n[1] != GLORIOUS_RECEIVER]
+    if not found and not qmk and explicit:
         sys.exit(f"{explicit}: not a supported device. It needs a vendor usage page and either the Glorious Series One "
-                 "Pro IDs (258a:2018 cable, 258a:2031 receiver) or [OpenDDPIv1] in its USB product string.")
-    if not found:
-        sys.exit("No supported device found. Connect the mouse by cable or plug in its receiver.")
+                 "Pro IDs (258a:2018 cable, 258a:2031 receiver) or [OpenDDPIv1] in its USB product string, or QMK's "
+                 "raw HID interface (usage page 0xFF60) with the open-directional-dpi adapter.")
     if len(wired) > 1 or (not wired and len(found) > 1):
-        sys.exit("Several devices found, pick one with --device: " + ", ".join(p for p, _ in found))
-    path, ids = (wired or found)[0]  # the cable wins over the receiver
-    try:
-        dev = Device(path, relay=ids == GLORIOUS_RECEIVER)
-        stamped = ids not in (GLORIOUS_WIRED, GLORIOUS_RECEIVER) or dev.has_dp01_stamp()
-    except PermissionError:
-        sys.exit(f"{path}: permission denied. Needs read/write access to the hidraw node: " + UDEV_HINT)
-    except OSError as e:
-        sys.exit(f"{path}: cannot query it ({e.strerror or e}).")
-    if not stamped:
-        sys.exit(f"{path}: no DP01 stamp" + (" through the receiver" if dev.relay else "") + ": the mouse runs stock "
-                 "firmware" + (" or a patch build without 2.4 GHz support" if dev.relay else "") +
+        sys.exit("Several devices found, pick one with --device: " + ", ".join(n[0] for n in found))
+    if found:
+        path, ids = (wired or found)[0][:2]  # the cable wins over the receiver
+        try:
+            dev = Device(path, open_io(path), relay=ids == GLORIOUS_RECEIVER)
+            if ids not in (GLORIOUS_WIRED, GLORIOUS_RECEIVER) or dev.has_dp01_stamp():
+                return dev
+        except PermissionError:
+            sys.exit(f"{path}: permission denied. Needs read/write access to the hidraw node: " + UDEV_HINT)
+        except OSError as e:
+            sys.exit(f"{path}: cannot query it ({e.strerror or e}).")
+        sys.exit(f"{path}: no DP01 stamp" + (" through the receiver" if dev.relay else "") + ": the mouse runs "
+                 "stock firmware" + (" or a patch build without 2.4 GHz support" if dev.relay else "") +
                  ". Flash the current open-directional-dpi patch (adapters/glorious-cm2856).")
-    return dev
+    probed, skipped = [], []
+    for path in qmk:
+        try:
+            dev = Device(path, open_io(path), raw=True)
+            if dev.answers_probe():
+                probed.append(dev)
+        except OSError as e:  # any keyboard: root-only without a udev rule, or held open by the VIA app
+            if explicit:
+                sys.exit(f"{path}: cannot query it ({e.strerror or e}).")
+            skipped.append(path)
+    if len(probed) > 1:
+        sys.exit("Several devices found, pick one with --device: " + ", ".join(d.path for d in probed))
+    if not probed and explicit:
+        sys.exit(f"{explicit}: no Open Directional DPI answer on this raw HID interface (a QMK, VIA or Vial board "
+                 "without the open-directional-dpi adapter).")
+    if not probed:
+        sys.exit("No supported device found. Connect the mouse by cable or plug in its receiver."
+                 + (f" Raw HID interfaces that did not open: {', '.join(skipped)}." if skipped else ""))
+    return probed[0]
 
 
 # --- commands ---------------------------------------------------------------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--device", help="hidraw node, e.g. /dev/hidraw9")
+    ap.add_argument("--device", help="hidraw node (e.g. /dev/hidraw9) or hidapi path, as listed when several are found")
+    ap.add_argument("--backend", choices=["hidraw", "hidapi"], default="hidraw" if sys.platform.startswith("linux") else "hidapi",
+                    help="hidraw: Linux, standard library (default there); hidapi: pip install hidapi (default elsewhere)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("info")
     p = sub.add_parser("load"); p.add_argument("file"); p.add_argument("--save", action="store_true")
@@ -269,13 +416,15 @@ def main() -> int:
     except (ValueError, OSError) as e:
         sys.exit(f"Invalid profile: {e}")
 
-    dev = find_device(a.device)
+    dev = find_device(a.device, a.backend)
     try:  # a failed command or an unplugged mouse ends in a message, not a traceback
         if a.cmd == "info":
             caps = dev.command(GET_CAPS)
             dpi_min, dpi_max, _, _, _, _, sensor_dpi = struct.unpack_from("<HHHHBBH", caps, 8)
-            print(f"device      : {dev.path} ({'2.4 GHz receiver' if dev.relay else 'direct'}, protocol {caps[4]}, DPI {dpi_min}..{dpi_max})")
+            print(f"device      : {dev.path} ({'2.4 GHz receiver' if dev.relay else 'QMK raw HID' if dev.raw else 'direct'}, protocol {caps[4]}, DPI {dpi_min}..{dpi_max})")
             print(f"current DPI : {sensor_dpi if sensor_dpi else 'not reported by this firmware'}")
+            if caps[7] & 0x80:
+                print(f"clock       : {struct.unpack_from('<I', caps, 20)[0]} ms (the firmware's idle-reset clock)")
             print(f"save to flash: {'yes' if caps[7] & 0x02 else 'no'}")
             print("profile     :", json.dumps(decode(dev.command(GET_PROFILE)), indent=2))
         elif a.cmd == "export":

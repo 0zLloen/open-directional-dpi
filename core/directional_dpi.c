@@ -278,6 +278,8 @@ void ddpi_engine_init(ddpi_engine_t *engine, uint16_t base_dpi) {
     engine->last_scale_q16_16 = DDPI_Q16_16_ONE;
     engine->last_motion_ms    = 0u;
     engine->sensor_dpi        = 0u;
+    engine->clock_known       = 0u;
+    engine->clock_ms          = 0u;
 }
 
 void ddpi_engine_reset_remainders(ddpi_engine_t *engine) {
@@ -296,6 +298,14 @@ void ddpi_engine_set_sensor_dpi(ddpi_engine_t *engine, uint16_t sensor_dpi) {
     }
     ddpi_engine_reset_remainders(engine);
     engine->sensor_dpi = sensor_dpi;
+}
+
+void ddpi_engine_set_clock_ms(ddpi_engine_t *engine, uint32_t now_ms) {
+    if (engine == NULL) {
+        return;
+    }
+    engine->clock_known = 1u;
+    engine->clock_ms = now_ms;
 }
 
 /* Curve off: identity profile, or bound to another DPI stage than the current one */
@@ -708,7 +718,8 @@ bool ddpi_hid_handle_feature_report(
                                    (on_enter_bootloader != NULL ? 0x08u : 0u) | /* bootloader_reentry */
                                    0x10u |                                      /* travel_window */
                                    0x20u |                                      /* linear_2x2 */
-                                   (engine->sensor_dpi != 0u ? 0x40u : 0u));    /* sensor_dpi known: ONLY_AT_BASE_DPI works */
+                                   (engine->sensor_dpi != 0u ? 0x40u : 0u) |    /* sensor_dpi known: ONLY_AT_BASE_DPI works */
+                                   (engine->clock_known != 0u ? 0x80u : 0u));   /* clock_ms valid */
             write_u16_le(&payload[8], 50u);
             write_u16_le(&payload[10], DDPI_DPI_MAX);
             write_u16_le(&payload[12], DDPI_Q8_8_MIN);
@@ -716,6 +727,7 @@ bool ddpi_hid_handle_feature_report(
             payload[16] = DDPI_DEFAULT_WINDOW_COUNTS;
             payload[17] = DDPI_MAX_WINDOW_COUNTS;
             write_u16_le(&payload[18], engine->sensor_dpi); /* current sensor DPI, 0 = unknown */
+            write_u32_le(&payload[20], engine->clock_ms);   /* adapter clock (ms), valid with flag bit 7 */
             break;
         }
 
@@ -748,8 +760,12 @@ bool ddpi_hid_handle_feature_report(
         case DDPI_CMD_RESET_DEFAULTS: {
             /* Keep the device's own base CPI and the reported sensor DPI; only the curve returns to neutral */
             uint16_t sensor_dpi = engine->sensor_dpi;
+            uint8_t clock_known = engine->clock_known;
+            uint32_t clock_ms = engine->clock_ms;
             ddpi_engine_init(engine, engine->profile.base_dpi);
             engine->sensor_dpi = sensor_dpi;
+            engine->clock_known = clock_known;
+            engine->clock_ms = clock_ms;
             ddpi_profile_serialize(&engine->profile, payload);
             break;
         }

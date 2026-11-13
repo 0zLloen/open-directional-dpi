@@ -10,9 +10,9 @@ Do the reverse engineering in [mouse-firmware-re](https://github.com/0zLloen/mou
 | A USB bootloader with verified write and read-back, and a verified rollback to the stock image | Compx ISP bootloader `258a:2103`, `compx_usb_flasher.py` (Linux). `VerifyByAddress` reads `0x6000..0x4D7FF` |
 | Free flash for the patch inside the range the bootloader's erase keeps, so an interruption between `Erase` and the `0xFF` write to the vector table leaves the old image intact (after that write, whether the bootloader stays resident is Unknown) | `0x1CD00..0x1DFFF`: after the stock image, below `0x1E000` (`Erase` keeps `0x6000..0x1DFFF`) |
 | Free SRAM that the stock firmware never touches, away from any bootloader magic word | `0x2003F000` (engine state), below the magic word at `0x2003FFFC` |
-| A hook at boot for one-time setup | `0xE874` (also checks the recovery chord) |
+| A hook at boot for one-time setup | `0xE874` (also checks the recovery chord: P1.15, P1.13, P1.00 low; verified 2026-11-13) |
 | The sensor burst-read call sites, and where the stock code keeps dx, dy and the motion flag | `0x131D8`, `0x13278` -> `0x1708C`; `0x20003020` / `0x2000302E` / `0x20003030` |
-| A clock for the idle reset (a millisecond counter, or a call made at a fixed rate) | Burst-read calls, one per 1 ms TIMER1 tick while still (inferred, 2026-11-13) |
+| A clock for the idle reset (a millisecond counter, or a call made at a fixed rate) | Burst-read calls, one per 1 ms TIMER1 tick while still: 1000.0 per second on the cable (verified 2026-11-13, `GET_CAPABILITIES` bytes `20..23`); over 2.4 GHz inferred to be the same |
 | A vendor Feature-report handler, a stock reply that can carry the `DP01` stamp, and a way to keep stock commands away from Open Directional DPI packets | `0xE8CE` -> `0x151AC`; version reply bytes `12..19`; stock rejects `feat[4] >= 5`, and DDPI `seq` is 5..255 |
 | Stock flash erase and write functions, and a free flash page for the saved profile that the bootloader's erase does not reach | `0xBE78` / `0xBED8`; page `0x7E000` |
 | The variable that holds the active DPI, if `ONLY_AT_BASE_DPI` should work | `0x20003068` (u16) |

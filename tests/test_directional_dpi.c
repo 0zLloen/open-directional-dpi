@@ -253,6 +253,22 @@ static void test_hid_protocol_handler(void) {
     assert(resp[4] == 0x2Au);
     assert(memcmp(&resp[8], "DP01", 4) == 0);
     assert(ddpi_crc16_ccitt(resp, 62u) == (uint16_t)(resp[62] | (resp[63] << 8)));
+    assert((resp[15] & 0x80u) == 0u); /* no clock reported yet */
+
+    /* The adapter clock appears at payload 20..23 with flag bit 7, and survives RESET_DEFAULTS */
+    ddpi_engine_set_clock_ms(&eng, 0x12345678u);
+    req[6] = DDPI_CMD_RESET_DEFAULTS;
+    crc = ddpi_crc16_ccitt(req, 62u);
+    req[62] = (uint8_t)(crc & 0xFFu);
+    req[63] = (uint8_t)(crc >> 8);
+    assert(ddpi_hid_handle_feature_report(&eng, req, resp, NULL, NULL));
+    req[6] = DDPI_CMD_GET_CAPABILITIES;
+    crc = ddpi_crc16_ccitt(req, 62u);
+    req[62] = (uint8_t)(crc & 0xFFu);
+    req[63] = (uint8_t)(crc >> 8);
+    assert(ddpi_hid_handle_feature_report(&eng, req, resp, NULL, NULL));
+    assert((resp[15] & 0x80u) != 0u);
+    assert(resp[28] == 0x78u && resp[29] == 0x56u && resp[30] == 0x34u && resp[31] == 0x12u);
 }
 
 /* 9. Verify Travel-Window Direction Estimator & Polling-Rate Chunking Invariance */
