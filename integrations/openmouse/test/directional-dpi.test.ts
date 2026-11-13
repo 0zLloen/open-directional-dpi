@@ -508,9 +508,11 @@ async function runTests(): Promise<void> {
   }
 
   {
-    /* 20. Through the 2.4 GHz receiver (258a:2031): relayed detection, relay envelope, transient 0xA4 */
+    /* 20. Through the 2.4 GHz receiver (258a:2031): relayed detection, relay envelope, transient 0xA4,
+     * link check before every request, one resend after a final 0xA4 */
     const rx = new MockGloriousReceiverHidDevice(new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1"));
-    const client = new OpenMouseDirectionalDpiClient(rx);
+    let waits = 0;
+    const client = new OpenMouseDirectionalDpiClient(rx, { onWaitForMouse: () => waits++ });
     const caps = await client.detectCapabilities();
     assert.equal(caps.firmwareKind, "open-directional-dpi-v1");
     assert.equal(caps.bootloaderReentry, false, "enterBootloader() cannot work through the receiver");
@@ -526,6 +528,14 @@ async function runTests(): Promise<void> {
     await assert.rejects(client.enterBootloader(), /needs the cable/);
     assert.equal(rx.mouse.inBootloaderMode, false);
     assert.equal(rx.localPackets, 0, "a request ran a receiver-local handler");
+    assert.equal(rx.linkQueries, rx.relayedPackets, "every relayed request follows one link query");
+    assert.equal(waits, 0);
+
+    /* No link for 3 queries (~300 ms): the user is asked once, then the request goes through */
+    rx.linkDownQueries = 3;
+    const queries = rx.linkQueries;
+    assert.equal((await client.getProfile()).multipliersQ8_8[DdpiDirection.N], 128);
+    assert.deepEqual([waits, rx.linkQueries - queries], [1, 4]);
 
     /* The receiver copies back the request's length: the stock 0x06 query loses the 12..15 stamp */
     await rx.sendFeatureReport(0, Uint8Array.from([0, 0, 0x02, 0x06, 0x00, 0x81]));
@@ -539,14 +549,24 @@ async function runTests(): Promise<void> {
     assert.deepEqual([stockCaps.firmwareKind, stockCaps.bootloaderReentry], ["stock-glorious", false]);
     assert.deepEqual([stockRx.mouse.featurePacketsReceived, stockRx.mouse.oddPacketsReceived, stockRx.localPackets], [1, 0, 0]);
 
-    /* Mouse off: only a 0xA4 still there at the 2 s deadline is an error */
+    /* Mouse off: only a 0xA4 still there at the 2 s deadline counts. The link query then answers
+     * 0x00 (2 queries in the mock), the user is asked once, and the request is sent once more.
+     * SIMULATE_DELTA (live engine) is sent only once. */
     rx.mouseOn = false;
-    await assert.rejects(client.getProfile(), /cannot reach the mouse/);
+    const offRx = new MockGloriousReceiverHidDevice(new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1"));
+    offRx.mouseOn = false;
+    const [sends, linkChecks, waited] = [rx.relayedPackets, rx.linkQueries, waits];
+    await Promise.all([
+      assert.rejects(client.getProfile(), /cannot reach the mouse/),
+      assert.rejects(new OpenMouseDirectionalDpiClient(offRx).simulateDelta(0, 100), /cannot reach the mouse/),
+    ]);
+    assert.deepEqual([rx.relayedPackets - sends, rx.linkQueries - linkChecks, waits - waited], [2, 4, 1]);
+    assert.deepEqual([offRx.relayedPackets, offRx.linkQueries], [1, 1]);
 
     const cable = new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1");
     assert.equal(preferCable([rx, cable]), cable);
     assert.equal(preferCable([rx]), rx);
-    console.log("  [PASS] 20. 2.4 GHz receiver: relayed detection and envelope, transient 0xA4, cable preferred");
+    console.log("  [PASS] 20. 2.4 GHz receiver: relayed detection and envelope, transient 0xA4, link wait, one resend, cable preferred");
   }
 
   {

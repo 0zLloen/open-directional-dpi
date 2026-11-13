@@ -21,6 +21,7 @@ SECTIONS
         KEEP(*(.text.entry_usb_proto))
         KEEP(*(.text.entry_sensor_burst))
         KEEP(*(.text.entry_rf_len_clamp))
+        KEEP(*(.text.entry_cpi_note))
         *(.text*)
         *(.rodata*)
         . = ALIGN(4);

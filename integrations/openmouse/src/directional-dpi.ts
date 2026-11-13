@@ -635,6 +635,12 @@ export function computePolarCurve360(
  * answers after ~770 ms (spec/hid-protocol-v1.md §2.3) */
 const ANSWER_DEADLINE_MS = 2000;
 const ANSWER_POLL_MS = 10;
+/* Receiver link-state query 0x89 (spec/hid-protocol-v1.md §2.3 "Link state and retries"):
+ * repeated this often while there is no link, and given up after LINK_WAIT_MS */
+const LINK_POLL_MS = 100;
+const LINK_WAIT_MS = 15000;
+const MOUSE_UNREACHABLE =
+  "The receiver cannot reach the mouse (switched off, asleep or out of range). Move or click it and try again, or use the cable.";
 
 /** Only this interface is probed (§6.3 rule 1); any other device keeps the Feature report path */
 function isQmkRawHid(t: WebHidFeatureTransport | WebHidRawTransport): t is WebHidRawTransport {
@@ -723,11 +729,20 @@ export class OpenMouseDirectionalDpiClient {
   private readonly transport: WebHidFeatureTransport;
   /** QMK raw HID interface (spec/hid-protocol-v1.md §6): framed packets, identified by the probe */
   private readonly qmkRawHid: boolean;
+  private readonly onWaitForMouse: (() => void) | undefined;
 
-  /** A WebHID HIDDevice: the Feature report, or QMK's raw HID interface (QMK_RAW_HID_FILTER) */
-  constructor(transport: WebHidFeatureTransport | WebHidRawTransport) {
+  /**
+   * A WebHID HIDDevice: the Feature report, or QMK's raw HID interface (QMK_RAW_HID_FILTER).
+   * onWaitForMouse: called once per request while the 2.4 GHz receiver has no link to the
+   * mouse; show "move or click the mouse". The request waits up to 15 s for the link.
+   */
+  constructor(
+    transport: WebHidFeatureTransport | WebHidRawTransport,
+    options: { onWaitForMouse?: () => void } = {}
+  ) {
     this.qmkRawHid = isQmkRawHid(transport);
     this.transport = isQmkRawHid(transport) ? qmkRawHidTransport(transport) : transport;
+    this.onWaitForMouse = options.onWaitForMouse;
   }
 
   /** The Glorious 2.4 GHz receiver relays requests to the mouse (spec/hid-protocol-v1.md §2.3) */
@@ -913,12 +928,19 @@ export class OpenMouseDirectionalDpiClient {
     await this.sendCommand(DdpiHidOpcode.ENTER_BOOTLOADER, 0, payload, true);
   }
 
+  /**
+   * Through the receiver: link check first, and a request that ends in a final 0xA4 is
+   * sent once more with a new seq (resend = false on that second send). SIMULATE_DELTA is
+   * not sent again: it changes the live engine. ENTER_BOOTLOADER is never relayed.
+   */
   private async sendCommand(
     opcode: DdpiHidOpcode,
     slot: number,
     payload: Uint8Array,
-    mayNotAnswer = false
+    mayNotAnswer = false,
+    resend = opcode !== DdpiHidOpcode.SIMULATE_DELTA
   ): Promise<Uint8Array> {
+    if (this.relay) await this.waitForLink();
     const pkt = new Uint8Array(DDPI_HID_PACKET_LENGTH);
     const seq = this.seq;
     this.seq = this.seq >= 255 ? 5 : this.seq + 1;
@@ -957,6 +979,10 @@ export class OpenMouseDirectionalDpiClient {
       if (!mayNotAnswer) throw err;
       return undefined; // e.g. the device left the bus while resetting
     });
+    if (resp === "unreachable") {
+      if (!resend) throw new Error(MOUSE_UNREACHABLE);
+      return this.sendCommand(opcode, slot, payload, mayNotAnswer, false);
+    }
     if (resp === undefined) {
       if (mayNotAnswer) return new Uint8Array(0);
       throw new Error(
@@ -983,11 +1009,11 @@ export class OpenMouseDirectionalDpiClient {
    * trip, and SAVE_FLASH erases a flash page first), so the first GET_REPORT can
    * return the previous answer. The receiver shows 0xA0 while a request is pending
    * and 0xA4 while the link is down; 0xA4 can be transient (SAVE_FLASH), so only
-   * a 0xA4 at the deadline means the mouse is unreachable.
+   * a 0xA4 at the deadline means the mouse is unreachable: "unreachable".
    */
   private async pollAnswer(
     isAnswer: (resp: Uint8Array) => boolean
-  ): Promise<Uint8Array | undefined> {
+  ): Promise<Uint8Array | "unreachable" | undefined> {
     const deadline = Date.now() + ANSWER_DEADLINE_MS;
     for (let i = 0; ; i++) {
       if (i > 0) await new Promise((r) => setTimeout(r, ANSWER_POLL_MS));
@@ -996,15 +1022,31 @@ export class OpenMouseDirectionalDpiClient {
       /* Strip leading Report ID 0x00 if WebHID/HIDAPI returned 65 bytes */
       const resp = raw.length === 65 && raw[0] === 0x00 ? raw.subarray(1, 65) : raw;
       if (isAnswer(resp)) return resp;
-      if (Date.now() >= deadline) {
-        if (this.relay && resp[0] === 0xa4) {
-          throw new Error(
-            "The 2.4 GHz receiver cannot reach the mouse (switched off, asleep or out of range)"
-          );
-        }
-        return undefined;
-      }
+      if (Date.now() >= deadline) return this.relay && resp[0] === 0xa4 ? "unreachable" : undefined;
     }
+  }
+
+  /**
+   * The receiver's own link-state query 0x89 (§2.3): body[6] = 0x01 is linked, anything
+   * else no link. No answer within ANSWER_DEADLINE_MS: unknown, taken as linked.
+   */
+  private async linkUp(): Promise<boolean> {
+    const req = new Uint8Array(DDPI_HID_PACKET_LENGTH);
+    req[5] = 0x89;
+    await this.transport.sendFeatureReport(0x00, req);
+    const resp = await this.pollAnswer((r) => r[0] === 0xa1 && r[5] === 0x89);
+    return !(resp instanceof Uint8Array) || resp[6] === 0x01;
+  }
+
+  /** Without a link: onWaitForMouse once, the query every LINK_POLL_MS, and no request after LINK_WAIT_MS */
+  private async waitForLink(): Promise<void> {
+    if (await this.linkUp()) return;
+    this.onWaitForMouse?.();
+    for (const end = Date.now() + LINK_WAIT_MS; Date.now() < end; ) {
+      await new Promise((r) => setTimeout(r, LINK_POLL_MS));
+      if (await this.linkUp()) return;
+    }
+    throw new Error(MOUSE_UNREACHABLE);
   }
 
   /**
@@ -1014,7 +1056,8 @@ export class OpenMouseDirectionalDpiClient {
    * the mouse and [3] = 0x0A copies back 16 bytes; only patch builds that
    * understand the relay envelope also stamp [12..15].
    */
-  private async gloriousVersionHasPatchStamp(): Promise<boolean> {
+  private async gloriousVersionHasPatchStamp(resend = true): Promise<boolean> {
+    if (this.relay) await this.waitForLink();
     const req = new Uint8Array(DDPI_HID_PACKET_LENGTH);
     req.set(this.relay ? [0x02, 0x0a, 0x00, 0x81] : [0x00, 0x06, 0x00, 0x81], 2);
     await this.transport.sendFeatureReport(0x00, req);
@@ -1023,6 +1066,10 @@ export class OpenMouseDirectionalDpiClient {
     const resp = await this.pollAnswer(
       (r) => r[0] === 0xa1 && r[4] === 0x00 && r[5] === 0x81
     );
+    if (resp === "unreachable") {
+      if (!resend) throw new Error(MOUSE_UNREACHABLE);
+      return this.gloriousVersionHasPatchStamp(false);
+    }
     const at = this.relay ? 12 : 16;
     return resp !== undefined && String.fromCharCode(...resp.subarray(at, at + 4)) === "DP01";
   }

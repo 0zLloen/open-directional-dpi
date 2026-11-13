@@ -1,7 +1,8 @@
 /**
  * Open Directional Sensitivity — calibrate.html WebHID client tests. The marked block is run
- * against the OpenMouse TS client (same bytes on the cable), the receiver's relay envelope
- * (spec/hid-protocol-v1.md §2.3) and a device that never identifies itself.
+ * against the OpenMouse TS client (same bytes on the cable and through the receiver), the
+ * receiver's relay envelope and link check (spec/hid-protocol-v1.md §2.3) and a device that
+ * never identifies itself.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -25,7 +26,7 @@ type Device = {
   sendFeatureReport(reportId: number, data: Uint8Array): Promise<void>;
   receiveFeatureReport(reportId: number): Promise<DataView>;
 };
-type Client = { dev: Device; relay: boolean; seq: number };
+type Client = { dev: Device; relay: boolean; seq: number; onWait?: () => void };
 type ProfileDoc = Record<string, unknown>;
 
 const html = readFileSync(new URL("../providers/builtin/calibrate.html", import.meta.url), "utf8");
@@ -41,7 +42,7 @@ const buildProfileJson = new Function(`${exportSrc}\nreturn buildProfileJson;`)(
 const page = new Function(`${clientSrc}\nreturn { encodeProfile, ddpiCommand, detectMouse, OP };`)() as {
   encodeProfile(doc: ProfileDoc): Uint8Array;
   ddpiCommand(c: Client, opcode: number, payload?: number[] | Uint8Array): Promise<Uint8Array>;
-  detectMouse(dev: Device, seq?: number): Promise<Client>;
+  detectMouse(dev: Device, seq?: number, onWait?: () => void): Promise<Client>;
   OP: Record<"GET_CAPABILITIES" | "SET_PROFILE" | "SAVE_FLASH" | "SET_ENABLED", number>;
 };
 
@@ -59,12 +60,19 @@ function recorded<T extends Device>(dev: T): Uint8Array[] {
 const isDdpi = (p: Uint8Array): boolean => p[0] === 0x44 && p[1] === 0x50 && p[5] === 0xdf;
 const STOCK_VERSION = [0xa1, 0, 0, 0x03, 0, 0x81, 0x01, 0, 0, 0, 0x20, 0x18]; // fact 3 (2026-11-13)
 const DP01 = [0x44, 0x50, 0x30, 0x31];
+const LINK_QUERY = [0, 0, 0, 0, 0, 0x89, ...new Array<number>(58).fill(0)]; // receiver-local 0x89
 
 /**
  * 258a:2031 as spec §2.3 describes it: forwards only body[2] = 0x02, sends and copies back
  * body[3] + 6 bytes (the rest of the reply buffer is stale), 0xA0 while pending, a transient
  * 0xA4 during SAVE_FLASH, and 0xA4 for good when the mouse is unreachable. The mouse behind it
  * restores the canonical body[0], [2], [3] before the DDPI handler checks the CRC, as the patch does.
+ * The link query 0x89 answers 0xA1 and body[6] = 0x01, or 0x00 for the next `linkDown` queries.
+ * Without a mouse each relayed request sets `linkDown` to 2: the receiver clears its link flag on
+ * link loss before it answers 0xA4 (disassembly 0xDA86 / 0xDAB0). A real receiver would answer 0x00
+ * until the mouse links again; the link coming back after 2 queries, and 0x01 before the first
+ * relayed request, are test shortcuts so the off case ends after two sends. The link state during
+ * the retail 0xA4 failures was not read. Only body[0..6] of the buffer change.
  */
 class FakeReceiver implements Device {
   vendorId = 0x258a;
@@ -74,6 +82,7 @@ class FakeReceiver implements Device {
   private pending: Uint8Array[] = []; // one per GET_REPORT, the last one stays
   private mouse: MockGloriousSeriesOneProHidDevice | null;
   stamped: boolean; // the mouse's version reply carries DP01 at 12..19
+  linkDown = 0;
 
   constructor(mouse: MockGloriousSeriesOneProHidDevice | null, stamped = true) {
     this.mouse = mouse;
@@ -84,6 +93,13 @@ class FakeReceiver implements Device {
   async sendFeatureReport(_id: number, body: Uint8Array): Promise<void> {
     const wait = Uint8Array.from(this.buf);
     wait[0] = 0xa0;
+    if (body[2] !== 0x02 && body[4] === 0x00 && body[5] === 0x89) {
+      const link = Uint8Array.from(this.buf);
+      link.set([0xa1, ...body.subarray(1, 6), this.linkDown > 0 ? 0x00 : 0x01]);
+      this.linkDown = Math.max(0, this.linkDown - 1);
+      this.pending = [link];
+      return;
+    }
     if (body[2] !== 0x02) {
       const echo = Uint8Array.from(body);
       echo[0] = 0xa3; // receiver-local: unknown command
@@ -94,6 +110,7 @@ class FakeReceiver implements Device {
       const down = Uint8Array.from(wait);
       down[0] = 0xa4;
       this.pending = [wait, down];
+      this.linkDown = 2; // link loss, see above
       return;
     }
     const n = body[3]! + 6;
@@ -127,8 +144,8 @@ class FakeReceiver implements Device {
 const GAINS = [1.0, 1.05, 1.2, 0.95, 0.9, 0.85, 0.8, 1.1];
 
 /** Bypass, send, save: the page's session, from detection on */
-async function pageSession(dev: Device, doc: ProfileDoc): Promise<Uint8Array> {
-  const c = await page.detectMouse(dev, 5);
+async function pageSession(dev: Device, doc: ProfileDoc, onWait?: () => void): Promise<Uint8Array> {
+  const c = await page.detectMouse(dev, 5, onWait);
   await page.ddpiCommand(c, page.OP.SET_ENABLED, [2]);
   await page.ddpiCommand(c, page.OP.SET_PROFILE, page.encodeProfile(doc));
   return page.ddpiCommand(c, page.OP.SAVE_FLASH);
@@ -171,9 +188,11 @@ test("receiver: the TS client's bytes, relay envelope outside the CRC", async ()
   const saved = await pageSession(rx, doc); // SAVE_FLASH passes a transient 0xA4
   const ts = await tsSession(new FakeReceiver(new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1")), doc);
   assert.deepEqual(sent, ts);
-  assert.deepEqual([...sent[0]!.subarray(0, 6)], [0, 0, 0x02, 0x0a, 0x00, 0x81]);
-  assert.equal(sent.length, 5);
-  for (const p of sent.slice(1)) {
+  assert.equal(sent.length, 10); // link query, request: version, GET_CAPABILITIES, SET_ENABLED, SET_PROFILE, SAVE_FLASH
+  const requests = sent.filter((_, i) => i % 2 === 1);
+  assert.deepEqual(sent.filter((_, i) => i % 2 === 0).map((p) => [...p]), new Array(5).fill(LINK_QUERY));
+  assert.deepEqual([...requests[0]!.subarray(0, 6)], [0, 0, 0x02, 0x0a, 0x00, 0x81]);
+  for (const p of requests.slice(1)) {
     assert.deepEqual([p[0], p[1], p[2], p[3], p[5]], [0x44, 0x50, 0x02, 0x3a, 0xdf]);
     const canonical = Uint8Array.from(p);
     canonical.set([0x01, 0x00], 2);
@@ -194,7 +213,7 @@ test("nothing but the version query before the DP01 stamp", async () => {
   const rx = new FakeReceiver(new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1"), false);
   const rxSent = recorded(rx);
   await assert.rejects(page.detectMouse(rx), /through the receiver/);
-  assert.equal(rxSent.length, 1);
+  assert.equal(rxSent.length, 2); // link query, version query
   assert.ok(!rxSent.some(isDdpi));
 
   /* A stamped reply left in the receiver (pending frames show it) is not this mouse's answer */
@@ -217,6 +236,15 @@ test("nothing but the version query before the DP01 stamp", async () => {
   await assert.rejects(page.detectMouse(other), /nothing was sent/);
 });
 
+test("receiver: no link at first, the page waits for the mouse once", async () => {
+  const rx = new FakeReceiver(new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1"));
+  rx.linkDown = 3;
+  let waits = 0;
+  const saved = await pageSession(rx, buildProfileJson(GAINS, 800, 16), () => waits++);
+  assert.equal(waits, 1);
+  assert.deepEqual([saved[3], saved[6]], [0xa1, page.OP.SAVE_FLASH]);
+});
+
 test("[OpenDDPIv1] devices skip the Glorious query; an unreachable mouse is reported", async () => {
   const tagged = new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1");
   tagged.vendorId = 0x1234;
@@ -230,5 +258,12 @@ test("[OpenDDPIv1] devices skip the Glorious query; an unreachable mouse is repo
   await page.ddpiCommand(c, page.OP.SET_ENABLED, [2]);
   assert.equal(sent[1]![4], 5); // seq wraps 255 -> 5, never below 5
 
-  await assert.rejects(page.detectMouse(new FakeReceiver(null)), /cannot reach the mouse/);
+  /* No mouse: final 0xA4, no link for 2 queries (the page waits once), the version query once more */
+  const off = new FakeReceiver(null);
+  const offSent = recorded(off);
+  let waits = 0;
+  await assert.rejects(page.detectMouse(off, 5, () => waits++), /cannot reach the mouse/);
+  assert.deepEqual(offSent.map((p) => (p[5] === 0x89 ? "link" : p[2] === 0x02 ? "relay" : "other")),
+    ["link", "relay", "link", "link", "link", "relay"]);
+  assert.equal(waits, 1);
 });

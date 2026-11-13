@@ -29,6 +29,9 @@ Through the receiver, requests carry the Compx relay envelope: body[2] = 0x02 (t
 body[3] = 0x3A (forward 64 bytes); the CRC still covers the canonical packet (body[2] = 1, body[3] = 0).
 Only patch builds that also stamp bytes 12..15 understand it, so older builds are never sent one.
 Sequence numbers are always >= 5: stock firmware rejects such a packet before running any handler.
+Before each relayed request the tool asks the receiver whether it has a link to the mouse (its own command 0x89); with
+no link it asks you to move or click the mouse and waits up to 15 s, and a request that ends in a final 0xA4 is sent once
+more (spec/hid-protocol-v1.md 2.3, "Link state and retries").
 
 The JSON mapping mirrors integrations/openmouse/src/directional-dpi.ts (exportProfileJson /
 importProfileJson); integrations/openmouse/test checks both directions against it.
@@ -54,6 +57,10 @@ GLORIOUS_WIRED, GLORIOUS_RECEIVER = (0x258A, 0x2018), (0x258A, 0x2031)
 FEATURE_USAGE, QMK_USAGE = (0xFFFF, 0x0000), (0xFF60, 0x61)  # spec 1 (Glorious interface 2), spec 6.1
 QMK_RDESC = bytes.fromhex("0660ff0961a101")  # QMK raw HID report descriptor start (spec 6.1)
 SYSFS = Path("/sys/class/hidraw")
+LINK_POLL_S, LINK_WAIT_S = 0.1, 15  # receiver link query: repeat interval, then give up (spec 2.3)
+WAIT_MSG = "Waiting for the mouse: move it or click a button (the receiver has no link to it)."
+UNREACHABLE_MSG = ("The receiver cannot reach the mouse (switched off, asleep or out of range). Move or click it and try "
+                   "again, or use the cable.")
 UDEV_HINT = ("install mouse-firmware-re devices/glorious-series-one-pro/udev/70-glorious-series-one-pro.rules "
              "(cable, receiver and bootloader), or run as root.")
 
@@ -240,29 +247,59 @@ class Device:
     def get(self) -> bytes:
         return self.io.get_feature()
 
-    def has_dp01_stamp(self) -> bool:
+    def has_dp01_stamp(self, resend: bool = True) -> bool:
         """Stock Glorious firmware-version query. The patch stamps 'DP01' at bytes 16..19 and, since it can
         relay over 2.4 GHz, also at 12..15 (only the first 16 bytes of this reply travel over the radio). The
         receiver copies back request body[3] + 6 bytes, so the relayed query asks for 16 (body[3] = 0x0A)."""
+        if self.relay:
+            self.wait_for_link()
         self.set(bytes([0, 0, 0x02, 0x0A, 0x00, 0x81] if self.relay else [0, 0, 0x00, 0x06, 0x00, 0x81]))
         r = self.poll(lambda r: r[0] == 0xA1 and r[5] == 0x81)
-        if r is None:
-            return False
-        return r[12:16] == b"DP01" or (not self.relay and r[16:20] == b"DP01")
+        if r[0] == 0xA1 and r[5] == 0x81:
+            return r[12:16] == b"DP01" or (not self.relay and r[16:20] == b"DP01")
+        return self.lost(r, resend) and self.has_dp01_stamp(False)
 
-    def poll(self, ok, seconds: float = 2.0) -> bytes | None:
-        """GET_REPORT until ok(reply). Through the receiver, 0xA4 (link down) can be transient: SAVE_FLASH's
-        page erase stalls the mouse's radio, the receiver shows 0xA4 after ~270 ms and the real reply still
-        arrives (~770 ms on a retail mouse). So only a final 0xA4 counts as an unreachable mouse."""
+    def poll(self, ok, seconds: float = 2.0) -> bytes:
+        """GET_REPORT until ok(reply) or the deadline; returns the last reply either way. Through the receiver,
+        0xA4 (link down) can be transient: SAVE_FLASH's page erase stalls the mouse's radio, the receiver shows
+        0xA4 after ~270 ms and the real reply still arrives (~770 ms on a retail mouse). So only a final 0xA4
+        counts (see lost())."""
         deadline, r = time.monotonic() + seconds, b""
         while time.monotonic() < deadline:
             time.sleep(0.005)
             r = self.get()
             if ok(r):
-                return r
-        if self.relay and r[:1] == b"\xA4":
-            sys.exit(f"{self.path}: the receiver cannot reach the mouse (switched off, asleep or out of range).")
-        return None
+                break
+        return r
+
+    def lost(self, r: bytes, resend: bool) -> bool:
+        """r is the last reply to a request that got no answer. A final 0xA4 through the receiver: True = send it
+        once more (spec 2.3); the second time the mouse counts as unreachable."""
+        if not (self.relay and r[:1] == b"\xA4"):
+            return False
+        if not resend:
+            sys.exit(f"{self.path}: {UNREACHABLE_MSG}")
+        return True
+
+    def link_up(self) -> bool:
+        """The receiver's own link-state query 0x89 (spec 2.3): body[6] = 0x01 is linked, anything else no link.
+        No answer within 2 s: unknown, taken as linked."""
+        self.set(bytes([0, 0, 0, 0, 0, 0x89]))
+        r = self.poll(lambda r: r[0] == 0xA1 and r[5] == 0x89)
+        return r[0] != 0xA1 or r[5] != 0x89 or r[6] == 0x01
+
+    def wait_for_link(self):
+        """Without a link: ask once for the mouse to be moved or clicked, query again every LINK_POLL_S, and give up
+        after LINK_WAIT_S without sending the request."""
+        if self.link_up():
+            return
+        print(WAIT_MSG, file=sys.stderr)
+        deadline = time.monotonic() + LINK_WAIT_S
+        while time.monotonic() < deadline:
+            time.sleep(LINK_POLL_S)
+            if self.link_up():
+                return
+        sys.exit(f"{self.path}: {UNREACHABLE_MSG}")
 
     def frame(self, chunk: int, data: bytes, deadline: float) -> bytes:
         """QMK raw HID (spec 6.2): send one 32-byte frame and return the board's reply to it, the next input report
@@ -276,7 +313,7 @@ class Device:
                 return r
         raise RuntimeError(f"no reply to raw HID frame 0x{chunk:02X}")
 
-    def command(self, opcode: int, payload: bytes = b"") -> bytes:
+    def command(self, opcode: int, payload: bytes = b"", resend: bool = True) -> bytes:
         self.seq = 5 + (self.seq - 4) % 251  # 5..255: stock firmware never runs a handler for these
         req = bytearray(64)
         req[0:3], req[4], req[5], req[6] = b"DP\x01", self.seq, NAMESPACE, opcode
@@ -292,13 +329,15 @@ class Device:
             for i in range(3):
                 self.frame(i, req[30 * i:30 * i + 30], deadline)
             r = b"".join(self.frame(0x80 | i, b"", deadline)[2:32] for i in range(3))[:64]
-            r = r if ok(r) else None
         else:
             if self.relay:
+                self.wait_for_link()
                 req[2], req[3] = 0x02, 0x3A  # relay envelope, outside the CRC (see module docstring)
             self.set(bytes(req))
             r = self.poll(ok)
-        if r is None:
+        if not ok(r):
+            if self.lost(r, resend):  # new seq and CRC; this tool sends neither SIMULATE_DELTA nor ENTER_BOOTLOADER
+                return self.command(opcode, payload, False)
             raise RuntimeError(f"no answer to opcode 0x{opcode:02X}")
         if r[3] != 0xA1:
             raise RuntimeError(f"opcode 0x{opcode:02X} failed: {STATUS.get(r[3], hex(r[3]))}")
