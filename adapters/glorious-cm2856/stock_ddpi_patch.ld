@@ -2,11 +2,15 @@
  * Linker script for Glorious Series One Pro surgical OpenDDPIv1 binary extension.
  * Appended at 0x0001CD00 immediately after the 93,328-byte stock firmware
  * (0x00006000..0x0001CC8F).
+ *
+ * PATCH_ROM ends at 0x1E000. The bootloader's Erase clears 0x1E000 up to at least
+ * 0x4D7FF and keeps 0x6000..0x1DFFF (Verified on a retail mouse, 2026-11-13), so the
+ * whole image stays in the range Erase keeps. Growing past it fails the link.
  */
 
 MEMORY
 {
-    PATCH_ROM (rx) : ORIGIN = 0x0001CD00, LENGTH = 0x00003300
+    PATCH_ROM (rx) : ORIGIN = 0x0001CD00, LENGTH = 0x00001300
 }
 
 SECTIONS

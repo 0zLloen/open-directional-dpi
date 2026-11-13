@@ -12,8 +12,11 @@ Load, save and export Open Directional DPI profiles on a mouse (Linux hidraw, st
 Devices: a Glorious Series One Pro running the open-directional-dpi patch, by cable (258a:2018) or
 through its 2.4 GHz receiver (258a:2031), detected by the DP01 stamp in its firmware-version reply
 (nothing else is sent to stock firmware); or any device whose USB product string contains
-"[OpenDDPIv1]". The cable is used when both are connected; --device /dev/hidrawN picks one.
-Without --save, a loaded profile lasts until the mouse powers off.
+"[OpenDDPIv1]". The cable is used when both are connected; --device /dev/hidrawN picks one of these
+(any other node is refused). Without --save, a loaded profile lasts until the mouse powers off.
+Needs read/write access to the mouse's hidraw node: install mouse-firmware-re
+devices/glorious-series-one-pro/udev/70-glorious-series-one-pro.rules (cable, receiver and bootloader),
+or run as root.
 
 Through the receiver, requests carry the Compx relay envelope: body[2] = 0x02 (target: mouse) and
 body[3] = 0x3A (forward 64 bytes); the CRC still covers the canonical packet (body[2] = 1, body[3] = 0).
@@ -41,6 +44,9 @@ KEYS = ["E_0", "SE_45", "S_90", "SW_135", "W_180", "NW_225", "N_270", "NE_315"] 
 GET_CAPS, GET_PROFILE, SET_PROFILE, SAVE_FLASH, RESET_DEFAULTS = 0x01, 0x02, 0x03, 0x04, 0x05
 STATUS = {0xA1: "ok", 0xA2: "CRC or format error", 0xA3: "unsupported", 0xA4: "out of range"}
 GLORIOUS_WIRED, GLORIOUS_RECEIVER = (0x258A, 0x2018), (0x258A, 0x2031)
+SYSFS = Path("/sys/class/hidraw")
+UDEV_HINT = ("install mouse-firmware-re devices/glorious-series-one-pro/udev/70-glorious-series-one-pro.rules "
+             "(cable, receiver and bootloader), or run as root.")
 
 
 def crc16(data: bytes) -> int:
@@ -203,25 +209,35 @@ class Device:
 
 
 def find_device(explicit: str | None) -> Device:
+    """Only nodes that identify themselves (spec/hid-protocol-v1.md 2.2): a vendor usage page plus the Glorious IDs
+    (then the DP01 stamp) or "[OpenDDPIv1]" in the product string. --device only picks among them."""
     found = []
-    for h in sorted(Path("/sys/class/hidraw").glob("hidraw*")):
+    for h in sorted(SYSFS.glob("hidraw*")):
         if explicit and h.name != Path(explicit).name:
             continue
         uevent = dict(l.split("=", 1) for l in (h / "device/uevent").read_text().splitlines() if "=" in l)
         _bus, vid, pid = (int(x, 16) for x in uevent.get("HID_ID", "0:0:0").split(":"))
         rdesc = (h / "device/report_descriptor").read_bytes()
         vendor_page = len(rdesc) >= 3 and rdesc[0] == 0x06 and rdesc[2] == 0xFF  # usage page 0xFFxx
-        if explicit or (vendor_page and ((vid, pid) in (GLORIOUS_WIRED, GLORIOUS_RECEIVER) or "[OpenDDPIv1]" in uevent.get("HID_NAME", ""))):
+        if vendor_page and ((vid, pid) in (GLORIOUS_WIRED, GLORIOUS_RECEIVER) or "[OpenDDPIv1]" in uevent.get("HID_NAME", "")):
             found.append((f"/dev/{h.name}", (vid, pid)))
     wired = [f for f in found if f[1] != GLORIOUS_RECEIVER]
+    if not found and explicit:
+        sys.exit(f"{explicit}: not a supported device. It needs a vendor usage page and either the Glorious Series One "
+                 "Pro IDs (258a:2018 cable, 258a:2031 receiver) or [OpenDDPIv1] in its USB product string.")
     if not found:
-        sys.exit("No supported device found. Connect the mouse by cable or plug in its receiver, check "
-                 "permissions on /dev/hidraw*, or pass --device.")
+        sys.exit("No supported device found. Connect the mouse by cable or plug in its receiver.")
     if len(wired) > 1 or (not wired and len(found) > 1):
         sys.exit("Several devices found, pick one with --device: " + ", ".join(p for p, _ in found))
     path, ids = (wired or found)[0]  # the cable wins over the receiver
-    dev = Device(path, relay=ids == GLORIOUS_RECEIVER)
-    if ids in (GLORIOUS_WIRED, GLORIOUS_RECEIVER) and not dev.has_dp01_stamp():
+    try:
+        dev = Device(path, relay=ids == GLORIOUS_RECEIVER)
+        stamped = ids not in (GLORIOUS_WIRED, GLORIOUS_RECEIVER) or dev.has_dp01_stamp()
+    except PermissionError:
+        sys.exit(f"{path}: permission denied. Needs read/write access to the hidraw node: " + UDEV_HINT)
+    except OSError as e:
+        sys.exit(f"{path}: cannot query it ({e.strerror or e}).")
+    if not stamped:
         sys.exit(f"{path}: no DP01 stamp" + (" through the receiver" if dev.relay else "") + ": the mouse runs stock "
                  "firmware" + (" or a patch build without 2.4 GHz support" if dev.relay else "") +
                  ". Flash the current open-directional-dpi patch (adapters/glorious-cm2856).")
@@ -254,27 +270,30 @@ def main() -> int:
         sys.exit(f"Invalid profile: {e}")
 
     dev = find_device(a.device)
-    if a.cmd == "info":
-        caps = dev.command(GET_CAPS)
-        dpi_min, dpi_max, _, _, _, _, sensor_dpi = struct.unpack_from("<HHHHBBH", caps, 8)
-        print(f"device      : {dev.path} ({'2.4 GHz receiver' if dev.relay else 'direct'}, protocol {caps[4]}, DPI {dpi_min}..{dpi_max})")
-        print(f"current DPI : {sensor_dpi if sensor_dpi else 'not reported by this firmware'}")
-        print(f"save to flash: {'yes' if caps[7] & 0x02 else 'no'}")
-        print("profile     :", json.dumps(decode(dev.command(GET_PROFILE)), indent=2))
-    elif a.cmd == "export":
-        text = json.dumps(decode(dev.command(GET_PROFILE)), indent=2) + "\n"
-        sys.stdout.write(text) if a.file == "-" else Path(a.file).write_text(text)
-    elif a.cmd == "load":
-        back = dev.command(SET_PROFILE, profile)[:28]
-        if back != profile:
-            print("note: the device adjusted the profile to its limits:", json.dumps(decode(back)), file=sys.stderr)
-        print("loaded" + (", saving..." if a.save else " (until power-off; add --save to keep it)"))
-    elif a.cmd == "reset":
-        dev.command(RESET_DEFAULTS)
-        print("reset to the flat default" + ("" if a.save else " (until power-off; add --save to keep it)"))
-    if a.cmd in ("load", "reset") and a.save:
-        dev.command(SAVE_FLASH)
-        print("saved")
+    try:  # a failed command or an unplugged mouse ends in a message, not a traceback
+        if a.cmd == "info":
+            caps = dev.command(GET_CAPS)
+            dpi_min, dpi_max, _, _, _, _, sensor_dpi = struct.unpack_from("<HHHHBBH", caps, 8)
+            print(f"device      : {dev.path} ({'2.4 GHz receiver' if dev.relay else 'direct'}, protocol {caps[4]}, DPI {dpi_min}..{dpi_max})")
+            print(f"current DPI : {sensor_dpi if sensor_dpi else 'not reported by this firmware'}")
+            print(f"save to flash: {'yes' if caps[7] & 0x02 else 'no'}")
+            print("profile     :", json.dumps(decode(dev.command(GET_PROFILE)), indent=2))
+        elif a.cmd == "export":
+            text = json.dumps(decode(dev.command(GET_PROFILE)), indent=2) + "\n"
+            sys.stdout.write(text) if a.file == "-" else Path(a.file).write_text(text)
+        elif a.cmd == "load":
+            back = dev.command(SET_PROFILE, profile)[:28]
+            if back != profile:
+                print("note: the device adjusted the profile to its limits:", json.dumps(decode(back)), file=sys.stderr)
+            print("loaded" + (", saving..." if a.save else " (until power-off; add --save to keep it)"))
+        elif a.cmd == "reset":
+            dev.command(RESET_DEFAULTS)
+            print("reset to the flat default" + ("" if a.save else " (until power-off; add --save to keep it)"))
+        if a.cmd in ("load", "reset") and a.save:
+            dev.command(SAVE_FLASH)
+            print("saved")
+    except (RuntimeError, ValueError, OSError) as e:
+        sys.exit(f"{dev.path}: {e}")
     return 0
 
 

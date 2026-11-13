@@ -55,6 +55,7 @@
       cursor: pointer;
       border: none;
     }
+    button:disabled { opacity: 0.45; cursor: default; }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -93,15 +94,22 @@
   <aside>
     <h1>Open Directional Sensitivity Calibration</h1>
     <p>Measures primary-submovement overshoot/undershoot across 8 counter-clockwise directions (<code>odd-sensor-ccw</code>) using raw Pointer Lock input.</p>
-    <p style="color: var(--warn)"><strong>Turn the directional curve off first.</strong> The browser sees motion after the mouse or host filter has applied it, so a calibration through an active curve is relative to it and recalibrating undoes the last one. OpenMouse: calibration bypass (<code>bypassForCalibration()</code>) or disable the curve; Linux: stop <code>odd_evdev_filter</code>; QMK and devicetree curves: flash a flat curve.</p>
+    <p style="color: var(--warn)"><strong>Turn the directional curve off first.</strong> The browser sees motion after the mouse or host filter has applied it, so a calibration through an active curve is relative to it and recalibrating undoes the last one. Glorious Series One Pro with the patch: <em>Turn curve off for calibration</em> below, or <code>python3 tools/odd_profile.py reset</code> (Linux, RAM only); other firmware with the HID protocol: <code>SET_ENABLED</code> mode 2 (<code>bypassForCalibration()</code> in <code>integrations/openmouse</code>); Linux: stop <code>odd_evdev_filter</code>; QMK and devicetree curves: flash a flat curve.</p>
+    <p>Send to mouse (WebHID: Chrome or Edge on Windows, macOS and Linux): a Glorious Series One Pro with the open-directional-dpi patch, by cable or through its 2.4 GHz receiver, or a device with <code>[OpenDDPIv1]</code> in its product name. Until it sees the patch's DP01 stamp, the page sends only the stock version query. A sent profile lasts until the mouse powers off; <em>Save on mouse</em> keeps it (each save erases a flash page, so save once at the end). If Connect does not work with the page opened as a file, serve it from localhost (<code>python3 -m http.server</code> in this folder). On Linux, Chrome needs write access to the mouse's <code>/dev/hidraw</code> node. Not yet tried on a real mouse (2026-11-13).</p>
     <div class="controls">
       <label>Base Sensor CPI <input type="number" id="baseCpi" value="800" min="50" max="65535" step="50" /></label>
       <label><input type="checkbox" id="onlyAtBaseDpi" /> Only at this DPI (one DPI stage, like Corsair PureVector)</label>
       <label>Trials per Direction <input type="number" id="trialsPerDir" value="8" min="3" max="40" /></label>
       <label>Travel Window L (counts, about 0.5 mm: follows the CPI) <input type="number" id="windowCounts" value="16" min="0" max="128" /></label>
+      <button id="connectBtn">Connect mouse (WebHID)</button>
+      <button id="bypassBtn" disabled>Turn curve off for calibration</button>
       <button class="primary" id="startBtn">Start Calibration (Pointer Lock)</button>
-      <button id="exportBtn">Download profile JSON (OpenMouse import)</button>
+      <button id="sendBtn" disabled>Send to mouse</button>
+      <button id="saveBtn" disabled>Save on mouse</button>
+      <button id="exportBtn">Download profile JSON</button>
     </div>
+    <p id="mouseStatus"></p>
+    <p id="moveRate">Motion: the browser's event rate shows after the first flick. Browsers can merge mouse reports, so this page does not see each report; movement sums stay exact. Per-report timing needs a raw log (mouse-log provider, <code>calibration/README.md</code>).</p>
     <table>
       <thead>
         <tr><th>Sector (CCW)</th><th>Trials</th><th>Med. Ratio</th><th>Gain</th></tr>
@@ -184,6 +192,121 @@
       };
     }
     // --- end profile export ---
+
+    // --- BEGIN webhid client (checked by calibration/tests/builtin-webhid.test.ts) ---
+    // Open Directional DPI over WebHID (spec/hid-protocol-v1.md), the same bytes as
+    // integrations/openmouse/src/directional-dpi.ts and tools/odd_profile.py. A Glorious mouse gets only
+    // the stock firmware-version query until its reply carries the patch's "DP01" stamp; any other device
+    // gets nothing unless its product name contains "[OpenDDPIv1]".
+    const GLORIOUS_VID = 0x258a, GLORIOUS_CABLE = 0x2018, GLORIOUS_RECEIVER = 0x2031;
+    const OP = { GET_CAPABILITIES: 0x01, SET_PROFILE: 0x03, SAVE_FLASH: 0x04, SET_ENABLED: 0x06 };
+    const HID_FILTERS = [ // the 64-byte vendor Feature report is on usage page 0xFFFF
+      { vendorId: GLORIOUS_VID, productId: GLORIOUS_CABLE, usagePage: 0xffff },
+      { vendorId: GLORIOUS_VID, productId: GLORIOUS_RECEIVER, usagePage: 0xffff },
+      { usagePage: 0xffff },
+    ];
+
+    function crc16(bytes) { // CRC-16-CCITT, polynomial 0x1021, initial value 0xFFFF
+      let crc = 0xffff;
+      for (const b of bytes) {
+        crc ^= b << 8;
+        for (let i = 0; i < 8; i++) crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff;
+      }
+      return crc;
+    }
+    const ascii4 = (r, at) => String.fromCharCode(...r.subarray(at, at + 4));
+
+    // 28-byte profile (spec/directional-dpi-v1.md §7) for a buildProfileJson() document
+    function encodeProfile(doc) {
+      const keys = ["E_0", "SE_45", "S_90", "SW_135", "W_180", "NW_225", "N_270", "NE_315"]; // HID clockwise
+      const ccw = doc.frame === "odd-sensor-ccw";
+      const q8_8 = (v) => Math.round(v * 256);
+      const b = new Uint8Array(28);
+      const v = new DataView(b.buffer);
+      v.setUint16(0, 0x4450, true); // "DP"
+      b[2] = 1;
+      b[3] = (doc.enabled ? 0x01 : 0) | (ccw ? 0x08 : 0) | (doc.model === "linear-2x2" ? 0x10 : 0) | (doc.onlyAtBaseDpi ? 0x80 : 0);
+      v.setUint16(4, doc.baseDpi, true);
+      v.setUint16(6, q8_8(doc.globalGain), true);
+      keys.forEach((k, dir) => v.setUint16(8 + 2 * (ccw ? (8 - dir) & 7 : dir), q8_8(doc.directionalMultipliers[k]), true));
+      v.setUint16(24, ((doc.idleResetMs / 5) << 8) | doc.windowCounts, true);
+      v.setUint16(26, crc16(b.subarray(0, 26)), true);
+      return b;
+    }
+
+    // 64-byte request. Through the receiver, body[2] = 0x02 (relay to the mouse) and body[3] = 0x3A
+    // (forward 64 bytes) replace 0x01 / 0x00 after the CRC, which covers the canonical packet.
+    function ddpiPacket(seq, opcode, payload, relay) {
+      const p = new Uint8Array(64);
+      p.set([0x44, 0x50, 0x01, 0x00, seq, 0xdf, opcode, 0]);
+      p.set(payload, 8);
+      const crc = crc16(p.subarray(0, 62));
+      p[62] = crc & 0xff;
+      p[63] = crc >> 8;
+      if (relay) p.set([0x02, 0x3a], 2);
+      return p;
+    }
+
+    // GET_REPORT until ok(reply), for up to 2 s: a save through the receiver answers after ~770 ms,
+    // with a transient 0xA4 first. Only a final 0xA4 means the receiver cannot reach the mouse.
+    async function poll(dev, relay, ok) {
+      let r = new Uint8Array(0);
+      for (const end = performance.now() + 2000; performance.now() < end; ) {
+        await new Promise((done) => setTimeout(done, 5));
+        const v = await dev.receiveFeatureReport(0);
+        r = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+        if (r.length === 65 && r[0] === 0) r = r.subarray(1); // some platforms return the report ID
+        if (ok(r)) return r;
+      }
+      if (relay && r[0] === 0xa4) throw new Error("The receiver cannot reach the mouse (switched off, asleep or out of range).");
+      return null;
+    }
+
+    // Sequence numbers stay in 5..255: stock Glorious firmware rejects body[4] >= 5 before any handler.
+    async function ddpiCommand(c, opcode, payload = []) {
+      const seq = c.seq;
+      c.seq = seq >= 255 ? 5 : seq + 1;
+      await c.dev.sendFeatureReport(0, ddpiPacket(seq, opcode, payload, c.relay));
+      const r = await poll(c.dev, c.relay, (r) => r.length >= 64 && r[0] === 0x44 && r[1] === 0x50 && r[4] === seq
+        && r[5] === 0xdf && r[6] === opcode && crc16(r.subarray(0, 62)) === (r[62] | (r[63] << 8)));
+      if (!r) throw new Error(`No answer to opcode 0x${opcode.toString(16)}.`);
+      if (r[3] !== 0xa1) throw new Error(`Opcode 0x${opcode.toString(16)} failed: status 0x${r[3].toString(16)}.`);
+      return r;
+    }
+
+    // Resolves to a client { dev, relay, seq } once the device has identified itself, else rejects.
+    async function detectMouse(dev, seq = 5 + Math.floor(Math.random() * 251)) {
+      const glorious = dev.vendorId === GLORIOUS_VID && (dev.productId === GLORIOUS_CABLE || dev.productId === GLORIOUS_RECEIVER);
+      const relay = glorious && dev.productId === GLORIOUS_RECEIVER;
+      if (glorious) {
+        // The patch stamps "DP01" at 12..15 and 16..19. Through the receiver only 12..15 counts: it copies
+        // back body[3] + 6 bytes, so the relayed query asks for 16 (body[3] = 0x0A).
+        const query = new Uint8Array(64);
+        query.set(relay ? [0, 0, 0x02, 0x0a, 0x00, 0x81] : [0, 0, 0x00, 0x06, 0x00, 0x81]);
+        await dev.sendFeatureReport(0, query);
+        // Only the finished version answer counts: a pending or stale frame can still hold an old stamp.
+        const stamped = (r) => ascii4(r, 12) === "DP01" || (!relay && ascii4(r, 16) === "DP01");
+        const r = await poll(dev, relay, (r) => r[0] === 0xa1 && r[5] === 0x81);
+        if (!r || !stamped(r)) {
+          throw new Error(`No DP01 stamp${relay ? " through the receiver" : ""}: the mouse runs stock firmware`
+            + `${relay ? " or a patch build without 2.4 GHz support" : ""}. Flash the patch (adapters/glorious-cm2856).`);
+        }
+      } else if (!dev.productName.includes("[OpenDDPIv1]")) {
+        throw new Error(`${dev.productName || "This device"} is not a supported mouse: nothing was sent.`);
+      }
+      const c = { dev, relay, seq };
+      const caps = await ddpiCommand(c, OP.GET_CAPABILITIES);
+      if (ascii4(caps, 8) !== "DP01") throw new Error("Unexpected GET_CAPABILITIES answer.");
+      return c;
+    }
+
+    async function requestMouse() {
+      const devices = await navigator.hid.requestDevice({ filters: HID_FILTERS });
+      const dev = devices.find((d) => d.collections.some((c) => c.usagePage === 0xffff && c.featureReports.length));
+      if (dev && !dev.opened) await dev.open();
+      return dev || null;
+    }
+    // --- END webhid client ---
 
     // Keep the travel window near 0.5 mm when the CPI changes (16 counts at 800 CPI)
     document.getElementById("baseCpi").addEventListener("input", (e) => {
@@ -300,17 +423,33 @@
       draw();
     });
 
-    document.addEventListener("mousemove", (e) => {
+    // Motion: pointerrawupdate (Chrome/Edge, secure context) is not tied to the display frame; mousemove
+    // is. Neither promises one event per mouse report: browsers can merge reports (OpenMouse's "565 Hz" on
+    // a 1000 Hz mouse was pointermove merging), so the page shows the rate it gets. Samples keep their
+    // event time and are at least SAMPLE_MS apart (the mouse-log provider's step), so the stop rule sees
+    // about the same spacing at any event rate.
+    const MOVE_EVENT = "onpointerrawupdate" in window ? "pointerrawupdate" : "mousemove";
+    const SAMPLE_MS = 4;
+    let lastMoveT = 0;
+    let moveGaps = [];
+    let drawQueued = false;
+
+    document.addEventListener(MOVE_EVENT, (e) => {
       if (document.pointerLockElement !== canvas) return;
       cursor.x += e.movementX;
       cursor.y += e.movementY;
       if (state === "FLICK") {
-        trace.push({ x: cursor.x, y: cursor.y, t: performance.now() });
+        moveGaps.push(e.timeStamp - lastMoveT);
+        if (e.timeStamp - trace[trace.length - 1].t >= SAMPLE_MS) trace.push({ x: cursor.x, y: cursor.y, t: e.timeStamp });
       }
-      draw();
+      lastMoveT = e.timeStamp;
+      if (!drawQueued) {
+        drawQueued = true;
+        requestAnimationFrame(() => { drawQueued = false; draw(); });
+      }
     });
 
-    canvas.addEventListener("mousedown", () => {
+    canvas.addEventListener("mousedown", (e) => {
       if (document.pointerLockElement !== canvas) return;
       if (state === "WAIT_CENTER") {
         if (Math.hypot(cursor.x, cursor.y) <= 20) {
@@ -320,13 +459,21 @@
             document.exitPointerLock();
           } else {
             cursor = { x: 0, y: 0 };
-            trace = [{ x: 0, y: 0, t: performance.now() }];
+            trace = [{ x: 0, y: 0, t: e.timeStamp }];
+            moveGaps = [];
             state = "FLICK";
           }
         } else {
           cursor = { x: 0, y: 0 };
         }
       } else if (state === "FLICK" && currentTrial) {
+        const gap = median(moveGaps);
+        if (moveGaps.length > 10 && gap > 0) {
+          document.getElementById("moveRate").textContent = `Motion: about ${Math.round(1000 / gap)} ${MOVE_EVENT} events/s `
+            + "in the last flick. The mouse sends 1000 reports/s by cable (about 960 through the receiver); browsers can merge "
+            + "reports, so this page does not see each one. Movement sums stay exact. Per-report timing needs a raw log "
+            + "(mouse-log provider, calibration/README.md).";
+        }
         const ratio = evaluateSubmovementRatio(trace, currentTrial.dist);
         if (ratio && ratio > 0.4 && ratio < 2.0) {
           ratiosBySector[currentTrial.sector].push(ratio);
@@ -347,6 +494,58 @@
       a.download = "odd-calibrated-profile.json";
       a.click();
     });
+
+    // Mouse buttons (WebHID client above). Save only on an explicit click, once per sent profile.
+    let mouse = null;
+    let sent = false;
+    let busy = false;
+    function mouseUi(msg) {
+      if (msg) document.getElementById("mouseStatus").textContent = msg;
+      document.getElementById("connectBtn").disabled = busy || !navigator.hid;
+      document.getElementById("bypassBtn").disabled = busy || !mouse;
+      document.getElementById("sendBtn").disabled = busy || !mouse;
+      document.getElementById("saveBtn").disabled = busy || !sent;
+    }
+    function onMouseClick(id, action) {
+      document.getElementById(id).addEventListener("click", async () => {
+        busy = true;
+        mouseUi("Working…");
+        try {
+          mouseUi(await action());
+        } catch (err) {
+          mouseUi(err.message || String(err));
+        } finally {
+          busy = false;
+          mouseUi();
+        }
+      });
+    }
+    onMouseClick("connectBtn", async () => {
+      mouse = null;
+      sent = false;
+      const dev = await requestMouse();
+      if (!dev) return "No device picked.";
+      mouse = await detectMouse(dev);
+      return `${dev.productName}: open-directional-dpi firmware found (${mouse.relay ? "2.4 GHz receiver" : "cable"}).`;
+    });
+    onMouseClick("bypassBtn", async () => {
+      sent = false; // even if this fails, the mouse's RAM may no longer hold the sent profile
+      await ddpiCommand(mouse, OP.SET_ENABLED, [2]);
+      return "Curve off (exact 1.00x) until you send a profile or the mouse powers off. Now start the calibration.";
+    });
+    onMouseClick("sendBtn", async () => {
+      sent = false;
+      await ddpiCommand(mouse, OP.SET_PROFILE, encodeProfile(updateTableAndJson()));
+      sent = true;
+      return "Profile sent. It lasts until the mouse powers off; Save on mouse keeps it.";
+    });
+    onMouseClick("saveBtn", async () => {
+      await ddpiCommand(mouse, OP.SAVE_FLASH);
+      sent = false;
+      return "Saved on the mouse.";
+    });
+    mouseUi(navigator.hid ? "Mouse: not connected."
+      : "Send to mouse needs WebHID: Chrome or Edge, with the page on localhost or https. Download the JSON instead.");
 
     resize();
     updateTableAndJson();

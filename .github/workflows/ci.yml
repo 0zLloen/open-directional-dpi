@@ -8,15 +8,31 @@ on:
 
 jobs:
   test-core-and-integrations:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: No vendor binaries or raw captures tracked
+        run: |
+          # .gitignore is the list of forbidden names; any file git stores as binary fails too
+          bad=$(git -c core.ignorecase=true ls-files -ci --exclude-standard
+                git ls-files --eol | awk -F'\t' '$1 ~ /^i\/-text/ {print $2}')
+          if [ -n "$bad" ]; then
+            echo "::error::Binary or capture files must not be committed (see CONTRIBUTING.md, Repository Rules):"
+            echo "$bad"
+            exit 1
+          fi
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
+
+      - name: Type-check TypeScript (strict, upstream mouse-protocol options)
+        run: |
+          npm ci --no-audit --no-fund
+          npx tsc -p tsconfig.json
 
       - name: Build and run C Reference Engine unit tests
         run: |
@@ -38,6 +54,26 @@ jobs:
           gcc -std=c11 -Wall -Wextra -Werror -pedantic -c adapters/qmk/odd_pointing_device.c -o /dev/null
           gcc -std=c11 -Wall -Wextra -Werror -pedantic -DMOUSE_EXTENDED_REPORT -c adapters/qmk/odd_pointing_device.c -o /dev/null
 
+      # The step above uses the adapter's stand-in types. This one uses QMK's own report.h,
+      # pointing_device.h and timer.h (headers only, no keyboard build); -include makes the
+      # stand-ins clash with them if the QMK_KEYBOARD_H branch is ever skipped. Bump tag and SHA together.
+      - name: Compile QMK adapter against QMK 0.34.8 headers
+        env:
+          QMK_SHA: ec8a1b6549a059cac1d284ec8b6377f63af75d05 # 0.34.8
+        run: |
+          Q="$RUNNER_TEMP/qmk"
+          git init -q "$Q"
+          git -C "$Q" remote add origin https://github.com/qmk/qmk_firmware
+          git -C "$Q" sparse-checkout set tmk_core/protocol quantum platforms
+          git -C "$Q" fetch -q --depth 1 --filter=blob:none origin "$QMK_SHA"
+          git -C "$Q" checkout -q FETCH_HEAD
+          for ext in "" -DMOUSE_EXTENDED_REPORT; do
+            gcc -std=gnu11 -Wall -Wextra -Werror -pedantic $ext \
+              -isystem "$Q/tmk_core/protocol" -isystem "$Q/quantum" -isystem "$Q/quantum/pointing_device" -isystem "$Q/platforms" \
+              -include timer.h -include pointing_device.h -DQMK_KEYBOARD_H='"pointing_device.h"' \
+              -c adapters/qmk/odd_pointing_device.c -o /dev/null
+          done
+
       # Fails if the patch outgrows PATCH_ROM, needs .bss/.data, pulls in a libgcc
       # __aeabi_* helper, or ddpi_sram_state_t reaches the bootloader magic word.
       - name: Guard Glorious CM2856 stock patch against core changes
@@ -53,3 +89,6 @@ jobs:
       - name: Run Calibration pipeline & provider tests
         run: |
           node --experimental-strip-types --test calibration/tests/*.test.ts
+
+      - name: Run odd_profile.py device-layer tests (fake cable and receiver)
+        run: python3 tools/test_odd_profile.py

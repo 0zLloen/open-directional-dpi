@@ -31,11 +31,12 @@ import {
   importProfileJson,
   isProfileIdentity,
   OpenMouseDirectionalDpiClient,
+  preferCable,
   SERIES_ONE_PRO_WIRED_BL_PID,
   serializeProfileV1,
   type WebHidFeatureTransport,
 } from "../src/directional-dpi.ts";
-import { MockGloriousSeriesOneProHidDevice } from "../src/mock-hid.ts";
+import { MockGloriousReceiverHidDevice, MockGloriousSeriesOneProHidDevice } from "../src/mock-hid.ts";
 
 async function runTests(): Promise<void> {
   console.log("=== OpenMouse — Open Directional DPI v1 Integration Tests ===");
@@ -372,10 +373,10 @@ async function runTests(): Promise<void> {
     console.log("  [PASS] 14. calibrate.html export maps CCW gains to physical directions");
   }
 
-  /* Test 15: Other devices need the "[OpenDDPIv1]" product string; bcdDevice is ignored */
+  /* Test 15: Other devices need the "[OpenDDPIv1]" product string */
   {
     const dev = new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1");
-    Object.assign(dev, { vendorId: 0x1d50, productId: 0x615e, productName: "Corne", bcdDevice: 0x0401 });
+    Object.assign(dev, { vendorId: 0x1d50, productId: 0x615e, productName: "Corne" });
     assert.equal((await new OpenMouseDirectionalDpiClient(dev).detectCapabilities()).firmwareKind, "unsupported");
     assert.equal(dev.featurePacketsReceived, 0);
 
@@ -383,7 +384,7 @@ async function runTests(): Promise<void> {
     const caps = await new OpenMouseDirectionalDpiClient(dev).detectCapabilities();
     assert.equal(caps.firmwareKind, "open-directional-dpi-v1");
     assert.equal(dev.featurePacketsReceived, 1); // GET_CAPABILITIES only
-    console.log("  [PASS] 15. Non-Glorious devices: product-string marker required, bcdDevice ignored");
+    console.log("  [PASS] 15. Non-Glorious devices: product-string marker required");
   }
 
   /* Test 16: linear-2x2 polar curve follows the C engine's matrix, not the angular blend */
@@ -404,7 +405,7 @@ async function runTests(): Promise<void> {
    * GET_REPORT returns the previous answer until the request has been processed */
   {
     const inner = new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1");
-    let ready = new Uint8Array(64);
+    let ready: Uint8Array = new Uint8Array(64);
     let pending: Uint8Array | undefined;
     let gets = 0;
     let staleGets = 2;
@@ -412,7 +413,6 @@ async function runTests(): Promise<void> {
       vendorId: inner.vendorId,
       productId: inner.productId,
       productName: inner.productName,
-      bcdDevice: inner.bcdDevice,
       async sendFeatureReport(_id, data) {
         pending = data.slice();
         gets = 0;
@@ -504,7 +504,49 @@ async function runTests(): Promise<void> {
     console.log("  [PASS] 19. tools/odd_profile.py matches the TypeScript JSON mapping byte for byte");
   }
 
-  console.log("\nAll 19/19 OpenMouse integration test suites passed.");
+  {
+    /* 20. Through the 2.4 GHz receiver (258a:2031): relayed detection, relay envelope, transient 0xA4 */
+    const rx = new MockGloriousReceiverHidDevice(new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1"));
+    const client = new OpenMouseDirectionalDpiClient(rx);
+    const caps = await client.detectCapabilities();
+    assert.equal(caps.firmwareKind, "open-directional-dpi-v1");
+    assert.equal(caps.bootloaderReentry, false, "enterBootloader() cannot work through the receiver");
+    const p = createDefaultProfileV1(800);
+    p.flags = DDPI_FLAG_ENABLED;
+    p.multipliersQ8_8[DdpiDirection.N] = 128;
+    assert.equal((await client.setProfile(p)).multipliersQ8_8[DdpiDirection.N], 128);
+    const t0 = Date.now();
+    assert.equal((await client.saveToFlash()).multipliersQ8_8[DdpiDirection.N], 128);
+    assert.ok(Date.now() - t0 >= 770, "SAVE_FLASH answered before the transient 0xA4 cleared");
+    rx.mouse.simulatePowerCycleReboot();
+    assert.equal((await client.getProfile()).multipliersQ8_8[DdpiDirection.N], 128);
+    await assert.rejects(client.enterBootloader(), /needs the cable/);
+    assert.equal(rx.mouse.inBootloaderMode, false);
+    assert.equal(rx.localPackets, 0, "a request ran a receiver-local handler");
+
+    /* The receiver copies back the request's length: the stock 0x06 query loses the 12..15 stamp */
+    await rx.sendFeatureReport(0, Uint8Array.from([0, 0, 0x02, 0x06, 0x00, 0x81]));
+    await new Promise((r) => setTimeout(r, 20));
+    const ver = new Uint8Array((await rx.receiveFeatureReport(0)).buffer);
+    assert.deepEqual([ver[0], ver[5], [...ver.subarray(12, 16)]], [0xa1, 0x81, [0, 0, 0, 0]]);
+
+    /* Stock mouse behind the receiver: no stamp, so no envelope request */
+    const stockRx = new MockGloriousReceiverHidDevice(new MockGloriousSeriesOneProHidDevice("stock-glorious"));
+    const stockCaps = await new OpenMouseDirectionalDpiClient(stockRx).detectCapabilities();
+    assert.deepEqual([stockCaps.firmwareKind, stockCaps.bootloaderReentry], ["stock-glorious", false]);
+    assert.deepEqual([stockRx.mouse.featurePacketsReceived, stockRx.mouse.oddPacketsReceived, stockRx.localPackets], [1, 0, 0]);
+
+    /* Mouse off: only a 0xA4 still there at the 2 s deadline is an error */
+    rx.mouseOn = false;
+    await assert.rejects(client.getProfile(), /cannot reach the mouse/);
+
+    const cable = new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1");
+    assert.equal(preferCable([rx, cable]), cable);
+    assert.equal(preferCable([rx]), rx);
+    console.log("  [PASS] 20. 2.4 GHz receiver: relayed detection and envelope, transient 0xA4, cable preferred");
+  }
+
+  console.log("\nAll 20/20 OpenMouse integration test suites passed.");
 }
 
 runTests().catch((err) => {

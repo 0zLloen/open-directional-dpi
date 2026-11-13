@@ -13,10 +13,13 @@ Bind your HID layer or listener to the **filter**, not the sensor. A callback on
 all devices (`INPUT_CALLBACK_DEFINE(NULL, ...)`) would see the raw motion and
 the filtered motion.
 
-Works with Zephyr 3.5 through 4.5 (tested on 3.5.0, 3.7.2, 4.5.0 and ZMK main),
-in both `CONFIG_INPUT_MODE_THREAD` and `CONFIG_INPUT_MODE_SYNCHRONOUS`. nRF
-Connect SDK 2.7 (Zephyr 3.6.99) has the same input API as 3.7.2; the build
-checks `input.h` for it, not the version number.
+Written for Zephyr 3.5 through 4.5, in both `CONFIG_INPUT_MODE_THREAD` and
+`CONFIG_INPUT_MODE_SYNCHRONOUS`. nRF Connect SDK 2.7 (Zephyr 3.6.99) has the
+same input API as 3.7.2; the build checks `input.h` for it, not the version
+number. CI runs the native_sim tests on Zephyr 3.7.2 and 4.5.0 and builds ZMK
+at `4dd95d7` for nice_nano. Zephyr 3.5 appears only in the `d0762df` commit
+message: CI does not build it, so the pre-3.6.99 callback code is not compiled
+there. Not yet run on a real Zephyr or ZMK mouse.
 
 A frame normally ends at the sync on its last axis. `wch,ch9350l` (the USB HID
 mouse bridge, Zephyr 4.4+) puts a sync on REL_X and another on REL_Y of each
@@ -70,6 +73,8 @@ two arguments.
 
 Other properties: `global-gain-q8-8`, `base-dpi`, `window-counts` (default 16),
 `idle-ms` (default 50), `merge-axis-syncs`. See `dts/bindings/odd,directional-dpi.yaml`.
+`node --experimental-strip-types calibration/cli.ts format profile.json --format dts`
+prints these properties for a calibrated profile.
 
 The curve applies to the axes the sensor driver reports. If the sensor is
 mounted rotated, fix that in the sensor node (`zephyr,axis-x/-y`,
@@ -108,7 +113,7 @@ When it is: add this module, put an `odd,directional-dpi` node on the sensor
 node, and point ZGM's input listener / HID layer at the filter device. Call
 `odd_input_hid_feature_report()` from its vendor HID handler.
 
-## HID feature report (profile editing from OpenMouse)
+## HID feature report (profile editing from a host)
 
 Zephyr has no generic routing for vendor feature reports, so the firmware's own
 HID handler calls the filter. Report descriptor (unnumbered, 64-byte feature):
@@ -142,8 +147,9 @@ static int get_report(const struct device *dev, uint8_t type, uint8_t id,
 }
 ```
 
-OpenMouse only talks to a non-Glorious device whose USB product string contains
-`[OpenDDPIv1]` (WebHID exposes no `bcdDevice`). Legacy USB stack:
+The hosts here (`calibrate.html` **Send to mouse**, `tools/odd_profile.py`, the
+client in `integrations/openmouse`) only talk to a non-Glorious device whose USB
+product string contains `[OpenDDPIv1]`. Legacy USB stack:
 `CONFIG_USB_DEVICE_PRODUCT="My Mouse [OpenDDPIv1]"` (ZMK fills it from
 `CONFIG_ZMK_KEYBOARD_NAME`); `device_next`: the string given to
 `USBD_DESC_PRODUCT_DEFINE()`.

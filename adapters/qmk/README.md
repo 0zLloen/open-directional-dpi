@@ -34,11 +34,26 @@ Integrates the portable C reference engine ([`core/directional_dpi.c`](../../cor
 
 The direction estimator restarts after the profile's idle gap (default 50 ms) using `timer_read32()`, so each flick starts from its own direction.
 
+`node --experimental-strip-types calibration/cli.ts format profile.json --format qmk` prints the `keyboard_post_init_user()` lines for a calibrated profile.
+
+## Single DPI stage
+
+To apply the curve at one DPI stage only (like Corsair PureVector), add to the profile in `keyboard_post_init_user()`:
+
+```c
+p.flags |= DDPI_FLAG_ONLY_AT_BASE_DPI;
+p.base_dpi = 1600;
+```
+
+The adapter feeds `pointing_device_get_cpi()` to the engine on every report, so the curve applies only while it returns 1600; every other DPI passes through unchanged.
+
 ## Report width
 
 Without `MOUSE_EXTENDED_REPORT`, QMK reports are 8-bit: drivers already clamp the sensor delta to ±127 (`CONSTRAIN_HID_XY`) before `pointing_device_task_user()` runs, and the adapter saturates the scaled output to ±127 too, so fast motion with gains above 1.00x loses counts. Enable `MOUSE_EXTENDED_REPORT`, or keep all gains ≤ 1.00x and raise the sensor CPI instead (`ddpi_profile_normalize_cpi_headroom()` computes it).
 
 ## Compile check without QMK
+
+CI compiles it against its stand-in types and against QMK 0.34.8's own `report.h`, `pointing_device.h` and `timer.h` (headers only). Not yet built in a QMK keyboard or run on a QMK device; the keymap snippet above is not compiled in CI.
 
 ```sh
 gcc -std=c11 -Wall -Wextra -Werror -pedantic -c odd_pointing_device.c -o /dev/null

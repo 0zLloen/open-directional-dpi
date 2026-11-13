@@ -7,6 +7,7 @@
  *      "DP01" stamped into the stock firmware-version answer, and the Open
  *      Directional DPI v1 commands answered like ddpi_hid_handle_feature_report()
  *      with the patch's save and bootloader callbacks.
+ * and the 2.4 GHz receiver (258a:2031) in front of either (MockGloriousReceiverHidDevice).
  *
  * Never interacts with physical USB hardware; enables 100% offline testing.
  *
@@ -37,12 +38,12 @@ import {
   DDPI_STATUS_ERR_UNSUPPORTED,
   DDPI_STATUS_OK,
   DdpiHidOpcode,
-  type DdpiProfileV1,
   deserializeProfileV1,
   GLORIOUS_VID,
   isProfileIdentity,
   SERIES_ONE_PRO_WIRED_BL_PID,
   SERIES_ONE_PRO_WIRED_PID,
+  SERIES_ONE_PRO_WIRELESS_PID,
   serializeProfileV1,
   type WebHidFeatureTransport,
 } from "./directional-dpi.ts";
@@ -53,8 +54,7 @@ const REM_LIMIT = 2147418112n;
 export class MockGloriousSeriesOneProHidDevice implements WebHidFeatureTransport {
   public vendorId = GLORIOUS_VID;
   public productId = SERIES_ONE_PRO_WIRED_PID;
-  public productName = "Series One PRO";
-  public bcdDevice = 0x0101;
+  public productName = "Series One PRO Wireless";
 
   /** Simulated top of nRF52840 256 KB SRAM (0x2003FFFC) */
   public sramBootloaderMagicWord = 0x00000000;
@@ -86,13 +86,21 @@ export class MockGloriousSeriesOneProHidDevice implements WebHidFeatureTransport
     }
     this.featurePacketsReceived++;
 
-    const req =
-      data.length === 65 && data[0] === 0x00 ? data.subarray(1, 65) : data;
+    const req = (
+      data.length === 65 && data[0] === 0x00 ? data.subarray(1, 65) : data
+    ).slice();
     const resp = new Uint8Array(DDPI_HID_PACKET_LENGTH);
     this.lastResponse = resp;
-    const isOdd = req[0] === 0x44 && req[1] === 0x50 && req[5] === DDPI_HID_NAMESPACE;
+    /* As ddpi_usb_protocol_wrapper(): byte 0 is not checked (the USB ISR and the
+     * receiver overwrite it with 0xA0) and the relay envelope is undone */
+    const isOdd = req[1] === 0x50 && req[5] === DDPI_HID_NAMESPACE;
     if (isOdd) {
       this.oddPacketsReceived++;
+      req[0] = 0x44;
+      if (req[2] === 0x02) {
+        req[2] = DDPI_PROFILE_VERSION;
+        req[3] = 0x00;
+      }
     }
 
     /* Stock Compx bootloader entry commands (0xB0 / 0x03) work in both modes */
@@ -102,11 +110,13 @@ export class MockGloriousSeriesOneProHidDevice implements WebHidFeatureTransport
       return;
     }
 
-    /* Stock firmware-version query (build_and_verify_patch.py test 3): v1.0.0.0, PID 2018 */
-    if (req[3] === 0x06 && req[4] === 0x00 && req[5] === 0x81) {
-      resp.set([0xa1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0x20, 0x18]);
+    /* Stock firmware-version query, retail reply v1.0.0.0 (2026-11-13); the patch
+     * matches [4], [5] only, so the relayed query ([3] = 0x0A) is answered too */
+    if (req[4] === 0x00 && req[5] === 0x81) {
+      resp.set([0xa1, 0x00, 0x00, 0x03, 0x00, 0x81, 0x01, 0x00, 0x00, 0x00, 0x20, 0x18]);
       if (this.mode === "open-directional-dpi-v1") {
-        resp.set([0x44, 0x50, 0x30, 0x31], 16); // "DP01"
+        resp.set([0x44, 0x50, 0x30, 0x31], 12); // "DP01", the part that crosses the radio
+        resp.set([0x44, 0x50, 0x30, 0x31], 16);
       }
       return;
     }
@@ -300,5 +310,80 @@ export class MockGloriousSeriesOneProHidDevice implements WebHidFeatureTransport
     this.remXQ16_16 = remX;
     this.remYQ16_16 = remY;
     return [outDx, outDy];
+  }
+}
+
+/** 8-byte radio chunks; replies are capped at 64 bytes (the patch's cap at stock 0x15D74) */
+const radioBytes = (len: number): number => Math.min(64, Math.ceil(len / 8) * 8);
+
+/**
+ * Mock Glorious 2.4 GHz receiver (258a:2031) in front of a mock mouse, as
+ * spec/hid-protocol-v1.md §2.3 (verified on a retail receiver, 2026-11-13):
+ * - It relays a request to the mouse only when body[2] = 0x02, sending
+ *   body[3] + 6 bytes with body[0] = 0xA0. The mouse replies reply[3] + 6 bytes.
+ * - GET_REPORT returns the request with body[0] = 0xA0 while it is pending, 0xA4
+ *   once the link has timed out (~270 ms), then the first body[3] + 6 bytes of the
+ *   reply (the request's length, not the reply's; the rest is stale).
+ * - SAVE_FLASH erases a flash page, which stalls the mouse's radio: transient 0xA4,
+ *   reply after ~770 ms. With `mouseOn = false` the 0xA4 never clears.
+ * Requests it does not relay run the receiver's own handlers (version, link state,
+ * RF ID, and the dangerous mode 0x00 / RF ID write 0x0A); this mock only counts
+ * them in `localPackets` and answers 0xA3 with an echo.
+ */
+export class MockGloriousReceiverHidDevice implements WebHidFeatureTransport {
+  public vendorId = GLORIOUS_VID;
+  public productId = SERIES_ONE_PRO_WIRELESS_PID;
+  public productName = "Series One PRO Wireless";
+  /** Off, asleep or out of range: relayed requests end in a lasting 0xA4 */
+  public mouseOn = true;
+  public localPackets = 0;
+  public readonly mouse: MockGloriousSeriesOneProHidDevice;
+
+  private buf = new Uint8Array(DDPI_HID_PACKET_LENGTH); // what GET_REPORT returns
+  private radio = new Uint8Array(DDPI_HID_PACKET_LENGTH); // last reply received over the radio
+  private toMouse = new Uint8Array(DDPI_HID_PACKET_LENGTH); // mouse side: stale past what was sent
+  private pending: { at: number; replyMs: number; len: number } | undefined;
+
+  constructor(mouse: MockGloriousSeriesOneProHidDevice) {
+    this.mouse = mouse;
+  }
+
+  async sendFeatureReport(reportId: number, data: Uint8Array): Promise<void> {
+    const req = data.length === 65 && data[0] === 0x00 ? data.subarray(1, 65) : data;
+    this.buf = new Uint8Array(DDPI_HID_PACKET_LENGTH);
+    this.buf.set(req.subarray(0, DDPI_HID_PACKET_LENGTH));
+    if (req[2] !== 0x02) {
+      this.localPackets++;
+      this.buf[0] = DDPI_STATUS_ERR_UNSUPPORTED;
+      this.pending = undefined;
+      return;
+    }
+    const len = Math.min(DDPI_HID_PACKET_LENGTH, req[3]! + 6);
+    this.buf[0] = 0xa0;
+    const saveFlash = req[1] === 0x50 && req[5] === DDPI_HID_NAMESPACE && req[6] === DdpiHidOpcode.SAVE_FLASH;
+    this.pending = { at: Date.now(), replyMs: !this.mouseOn ? Infinity : saveFlash ? 770 : 8, len };
+    if (!this.mouseOn) return;
+    this.toMouse.set(req.subarray(0, radioBytes(len)));
+    this.toMouse[0] = 0xa0;
+    await this.mouse.sendFeatureReport(reportId, this.toMouse);
+    const reply = new Uint8Array((await this.mouse.receiveFeatureReport(reportId)).buffer);
+    this.radio.set(reply.subarray(0, radioBytes(reply[3]! + 6)));
+  }
+
+  async receiveFeatureReport(reportId: number): Promise<DataView> {
+    if (reportId !== 0x00) {
+      throw new Error(`Unsupported Feature Report ID: ${reportId}`);
+    }
+    const p = this.pending;
+    if (p) {
+      const t = Date.now() - p.at;
+      if (t >= p.replyMs) {
+        this.buf.set(this.radio.subarray(0, p.len));
+        this.pending = undefined;
+      } else {
+        this.buf[0] = t >= 270 ? 0xa4 : 0xa0;
+      }
+    }
+    return new DataView(this.buf.slice().buffer);
   }
 }
