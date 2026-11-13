@@ -276,6 +276,8 @@ def main() -> int:
             dpi_min, dpi_max, _, _, _, _, sensor_dpi = struct.unpack_from("<HHHHBBH", caps, 8)
             print(f"device      : {dev.path} ({'2.4 GHz receiver' if dev.relay else 'direct'}, protocol {caps[4]}, DPI {dpi_min}..{dpi_max})")
             print(f"current DPI : {sensor_dpi if sensor_dpi else 'not reported by this firmware'}")
+            if caps[7] & 0x80:
+                print(f"clock       : {struct.unpack_from('<I', caps, 20)[0]} ms (the firmware's idle-reset clock)")
             print(f"save to flash: {'yes' if caps[7] & 0x02 else 'no'}")
             print("profile     :", json.dumps(decode(dev.command(GET_PROFILE)), indent=2))
         elif a.cmd == "export":

@@ -156,6 +156,8 @@ export interface DdpiDeviceCapabilities {
   maxMultiplierQ8_8: number;
   /** Current sensor DPI as reported by the firmware (0 = unknown; then onlyAtBaseDpi has no effect) */
   sensorDpi: number;
+  /** The firmware's millisecond clock (the one its idle reset uses), or null if not reported */
+  clockMs: number | null;
 }
 
 export interface WebHidFeatureTransport {
@@ -688,6 +690,7 @@ export class OpenMouseDirectionalDpiClient {
         minMultiplierQ8_8: DDPI_Q8_8_ONE,
         maxMultiplierQ8_8: DDPI_Q8_8_ONE,
         sensorDpi: 0,
+        clockMs: null,
       };
     }
 
@@ -721,6 +724,7 @@ export class OpenMouseDirectionalDpiClient {
       minMultiplierQ8_8: dv.getUint16(20, true),
       maxMultiplierQ8_8: dv.getUint16(22, true),
       sensorDpi: dv.getUint16(26, true),
+      clockMs: (hwFlags & 0x80) !== 0 ? dv.getUint32(28, true) : null,
     };
   }
 

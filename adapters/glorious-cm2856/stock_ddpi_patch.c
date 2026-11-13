@@ -171,6 +171,7 @@ void ddpi_usb_protocol_wrapper(void) {
         ddpi_ensure_initialized();
         ddpi_sram_state_t *st = get_ddpi_state();
         ddpi_engine_set_sensor_dpi(&st->engine, STOCK_ACTIVE_DPI_X);
+        ddpi_engine_set_clock_ms(&st->engine, st->burst_calls); /* lets a host measure the idle-reset clock */
 
         uint8_t req_copy[DDPI_HID_PACKET_LEN];
         memcpy(req_copy, feat, DDPI_HID_PACKET_LEN);

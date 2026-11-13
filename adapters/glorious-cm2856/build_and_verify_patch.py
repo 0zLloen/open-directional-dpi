@@ -562,7 +562,20 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
             burst(0x00)
         out = burst(0x80, 0, -8)
         assert out == (0, expected_dy), f"{idle_calls} idle calls: North -8 -> {out}, expected (0, {expected_dy})"
-    print("  [PASS] Test 10: Idle reset after 50 burst calls (North -8 -> -4 after 49 idle calls; -8 after 48, still East)")
+
+    def caps_clock() -> int:
+        mu.mem_write(0x20004F28, make_ddpi_req(0x01))
+        mu.mem_write(0x200032D4, b"\x01")
+        call_bl_site_at(0x0000E8CE)
+        r = bytes(mu.mem_read(0x20006000, 64))
+        assert r[3] == 0xA1 and r[15] & 0x80, "GET_CAPABILITIES must report the clock (flag bit 7)"
+        return struct.unpack_from("<I", r, 28)[0]
+
+    c0 = caps_clock()
+    for _ in range(25):
+        burst(0x00)
+    assert caps_clock() - c0 == 25, "the reported clock must count burst calls"
+    print("  [PASS] Test 10: Idle reset after 50 burst calls (North -8 -> -4 after 49 idle calls; -8 after 48, still East; GET_CAPABILITIES clock = burst calls)")
 
     print("[UNICORN] All 10 instruction-level Cortex-M4F hardware emulation tests PASSED!")
 

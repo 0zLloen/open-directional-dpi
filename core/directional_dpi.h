@@ -135,6 +135,8 @@ typedef struct {
     uint32_t          last_scale_q16_16;   /* Most recent effective scale (Q16.16) */
     uint32_t          last_motion_ms;      /* Timestamp of last non-zero motion (ddpi_process_motion) */
     uint16_t          sensor_dpi;          /* Current sensor DPI reported by the adapter (0 = unknown) */
+    uint8_t           clock_known;         /* 1 once the adapter reported its clock (ddpi_engine_set_clock_ms) */
+    uint32_t          clock_ms;            /* Adapter's millisecond clock as last reported; GET_CAPABILITIES bytes 20..23 */
 } ddpi_engine_t;
 
 /**
@@ -236,6 +238,12 @@ void ddpi_engine_notify_idle(ddpi_engine_t *engine);
  * is unknown the flag has no effect. A change of DPI clears remainders and direction.
  */
 void ddpi_engine_set_sensor_dpi(ddpi_engine_t *engine, uint16_t sensor_dpi);
+
+/**
+ * Report the adapter's millisecond clock (the same clock it passes to ddpi_process_motion).
+ * GET_CAPABILITIES returns it, so a host can check the clock rate against wall time.
+ */
+void ddpi_engine_set_clock_ms(ddpi_engine_t *engine, uint32_t now_ms);
 
 /**
  * Load a validated profile into the runtime engine (clamping parameters to safe bounds).

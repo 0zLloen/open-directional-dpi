@@ -468,6 +468,9 @@ async function runTests(): Promise<void> {
     assert.equal((await client.detectCapabilities()).sensorDpi, 0);
     mock.sensorDpi = 1600;
     assert.equal((await client.detectCapabilities()).sensorDpi, 1600);
+    assert.equal((await client.detectCapabilities()).clockMs, null);
+    mock.clockMs = 0x12345678;
+    assert.equal((await client.detectCapabilities()).clockMs, 0x12345678);
     console.log("  [PASS] 18. Single DPI stage flag (JSON) and sensor DPI in capabilities");
   }
 
