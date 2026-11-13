@@ -10,7 +10,7 @@
 
 #include "../../core/directional_dpi.h"
 
-/* Minimal freestanding memcpy / memset / memcmp for -nostdlib builds */
+/* Minimal freestanding memcpy / memset for -nostdlib builds */
 void *memcpy(void *dst, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
@@ -66,6 +66,7 @@ typedef uint8_t (*stock_flash_write_fn_t)(uint32_t flash_addr, const void *src, 
 typedef struct {
     uint32_t      init_magic;
     ddpi_engine_t engine;
+    uint32_t      burst_calls; /* Clock for the idle reset (ddpi_paw3370_burst_wrapper) */
 } ddpi_sram_state_t;
 
 /* Engine state must never reach the Compx bootloader magic word at 0x2003FFFC */
@@ -86,6 +87,17 @@ static bool ddpi_save_flash_page_0x7E000(const ddpi_profile_v1_t *profile) {
     uint8_t aligned_buf[32] __attribute__((aligned(4)));
     memset(aligned_buf, 0xFF, sizeof(aligned_buf));
     ddpi_profile_serialize(profile, aligned_buf);
+
+    /* Every save is a page erase (nRF52840: ~10,000 cycles per page), so an unchanged
+     * profile is not written again. */
+    const uint8_t *stored = (const uint8_t *)DDPI_FLASH_STORAGE_ADDR;
+    size_t i = 0u;
+    while (i < DDPI_PROFILE_SERIALIZED_LEN && stored[i] == aligned_buf[i]) {
+        ++i;
+    }
+    if (i == DDPI_PROFILE_SERIALIZED_LEN) {
+        return true;
+    }
 
     uint8_t erase_rc = STOCK_FN_FLASH_ERASE_PAGE(DDPI_FLASH_STORAGE_ADDR);
     if (erase_rc != 0u) {
@@ -208,20 +220,25 @@ __attribute__((used, section(".text.entry_sensor_burst")))
 void ddpi_paw3370_burst_wrapper(void) {
     STOCK_FN_PAW3370_BURST();
 
+    /* The idle reset counts these calls as milliseconds. Stock has no usable free-running ms clock,
+     * but it calls the burst once per 1 ms TIMER1 tick at 0x13278, motion or not, plus once
+     * per tick at 0x131D8 while the sensor's motion pin is low. So a gap without motion
+     * counts 1 call per ms. A stalled main loop merges ticks, which only delays the reset.
+     * Inferred from the stock disassembly and Unicorn (2026-11-13), not measured on
+     * hardware; over 2.4 GHz the radio re-times the tick (about 1 ms, inferred). */
+    ddpi_sram_state_t *st = get_ddpi_state();
+    st->burst_calls++;
+
     if ((STOCK_SENSOR_STATE_MOTION & 0x80u) != 0u) {
         ddpi_ensure_initialized();
-        ddpi_sram_state_t *st = get_ddpi_state();
 
         int16_t raw_dx = STOCK_SENSOR_STATE_DX;
         int16_t raw_dy = STOCK_SENSOR_STATE_DY;
         int16_t out_dx = raw_dx;
         int16_t out_dy = raw_dy;
 
-        /* No idle reset (ddpi_process_motion): no verified stock millisecond tick to
-         * read yet. A profile with travel window L > 0 lets a new flick's first ~L
-         * counts lean toward the previous direction; L = 0 has no such carry-over. */
         ddpi_engine_set_sensor_dpi(&st->engine, STOCK_ACTIVE_DPI_X); /* single-DPI-stage profiles */
-        ddpi_process_delta(&st->engine, raw_dx, raw_dy, &out_dx, &out_dy);
+        ddpi_process_motion(&st->engine, raw_dx, raw_dy, st->burst_calls, &out_dx, &out_dy);
 
         STOCK_SENSOR_STATE_DX = out_dx;
         STOCK_SENSOR_STATE_DY = out_dy;

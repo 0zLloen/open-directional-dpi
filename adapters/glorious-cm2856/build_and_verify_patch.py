@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
 """
-Build & Unicorn ARM Cortex-M4F Hardware Emulator Verification for
-Glorious Forge Series One Pro — Surgical OpenDDPIv1 Firmware Extension.
+Build and verify the open-directional-dpi patch for the Glorious Series One Pro
+(Compx CM2856, stock firmware CM2856_Mouse_USB_v1.00.00_20220810).
 
-1. Compiles stock_ddpi_patch.c + core/directional_dpi.c at 0x0001CD00 using
-   arm-none-eabi-gcc (-mcpu=cortex-m4 -mthumb -Os -ffreestanding -nostdlib).
-2. Appends the compiled extension to the official CM2856_Mouse_USB_v1.00.00_20220810.bin
-   and redirects the 4 call-sites (0x0000E874, 0x0000E8CE, 0x000131D8, 0x00013278).
-3. Generates CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.bin and .hex, and verifies the image
-   against Compx bootloader constraints via compx_hex_tool.py.
-4. Loads the complete patched ARM Cortex-M4F firmware image into the Unicorn CPU
-   emulator and executes comprehensive instruction-level hardware verification tests
-   before any physical hardware interaction.
+1. Loads the stock application image: adapters/stock/CM2856_Mouse_USB_v1.00.00_20220810.bin
+   (the decoded official .hex), or --stock-hex <official .hex, or a dump .hex of your own
+   stock mouse>. A .hex is decoded and trimmed to the stock length. The image must have
+   SHA-256 e50510e0... (STOCK_SHA256) or the build stops.
+2. Compiles stock_ddpi_patch.c + core/directional_dpi.c at 0x0001CD00 with
+   $CROSS{gcc,objcopy,nm,objdump} (CROSS defaults to arm-none-eabi-, as in the Makefile).
+3. Appends the patch to the stock image, redirects the 4 call sites (0x0000E874, 0x0000E8CE,
+   0x000131D8, 0x00013278) and replaces the two 2.4 GHz reply-length reads (0x00015D8C,
+   0x00015DB4) with the 64-byte clamp.
+4. Runs the compx_hex_tool.py safety audit (mouse-firmware-re) on the image.
+5. Runs the patched image in Unicorn (pip install unicorn; required) with 10 tests:
+   1-2 boot hook (recovery chord, normal boot), 3 stock version query + "DP01" stamp,
+   4 stock bootloader entry (feat[3]=0x01, feat[6]=0xB0), 5 GET_CAPABILITIES,
+   6 SET_PROFILE + SAVE_FLASH (an identical second save does not erase), 7 sensor hooks,
+   8 request relayed through the 2.4 GHz receiver, 9 2.4 GHz reply capped at 64 bytes,
+   10 idle reset of the direction estimator after 50 burst calls (1 per ms tick).
+6. Only then writes adapters/build/CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.bin and .hex.
+
+Exits non-zero if the toolchain, compx_hex_tool.py, unicorn or the stock image is missing,
+or if any check fails. Any old OpenDDPIv1 .bin/.hex is deleted first, so a failed run leaves
+no image to flash. The checks are assert statements: python3 -O is refused.
 """
 
+import argparse
+import hashlib
 import os
 import shutil
 import struct
@@ -29,13 +43,50 @@ BUILD_DIR = PATCH_DIR.parent / "build"
 TOOLS_DIR = Path(os.environ.get("COMPX_TOOLS", REPO_ROOT.parent / "mouse-firmware-re" / "platforms" / "compx-nrf52" / "tools"))
 CORE_DIR = REPO_ROOT / "core"
 
-ARM_GCC = shutil.which("arm-none-eabi-gcc") or "/tmp/arm-root/usr/bin/arm-none-eabi-gcc"
-ARM_OBJCOPY = shutil.which("arm-none-eabi-objcopy") or "/tmp/arm-root/usr/bin/arm-none-eabi-objcopy"
-ARM_NM = shutil.which("arm-none-eabi-nm") or "/tmp/arm-root/usr/bin/arm-none-eabi-nm"
-ARM_OBJDUMP = shutil.which("arm-none-eabi-objdump") or "/tmp/arm-root/usr/bin/arm-none-eabi-objdump"
+# Same convention as the Makefile: CROSS=/opt/arm/bin/arm-none-eabi- if the tools are not on PATH
+CROSS = os.environ.get("CROSS", "arm-none-eabi-")
+ARM_GCC, ARM_OBJCOPY, ARM_NM, ARM_OBJDUMP = (CROSS + t for t in ("gcc", "objcopy", "nm", "objdump"))
 
 APP_BASE = 0x00006000
 PATCH_BASE = 0x0001CD00
+STOCK_BIN = STOCK_DIR / "CM2856_Mouse_USB_v1.00.00_20220810.bin"
+STOCK_LEN = 0x0001CC90 - APP_BASE  # 93,328 bytes
+# Decoded official CM2856_Mouse_USB_v1.00.00_20220810.hex (sha256 2c5c1672...); also the first
+# 93,328 bytes of a VerifyByAddress dump of a retail mouse on stock v1.0.0.0 (checked 2026-11-13).
+STOCK_SHA256 = "e50510e0eb213e69d62a088d6f5b792fb88b0f3dc56d3c9c21dd0ca8b6e892be"
+
+
+def import_compx_hex_tool():
+    if not (TOOLS_DIR / "compx_hex_tool.py").is_file():
+        sys.exit(
+            f"compx_hex_tool.py not found in {TOOLS_DIR}: clone "
+            "https://github.com/0zLloen/mouse-firmware-re next to this repo or set COMPX_TOOLS"
+        )
+    sys.path.insert(0, str(TOOLS_DIR))
+    import compx_hex_tool
+
+    return compx_hex_tool
+
+
+def load_stock_image(stock_hex) -> bytes:
+    """Stock app image from the official .hex or a dump .hex, else the decoded .bin; checked by SHA-256."""
+    if stock_hex is not None:
+        try:
+            data = import_compx_hex_tool().load_app_hex(stock_hex, APP_BASE)[0][:STOCK_LEN]
+        except (OSError, ValueError) as e:
+            sys.exit(f"--stock-hex: {e}")
+        src = stock_hex
+    elif STOCK_BIN.is_file():
+        data, src = STOCK_BIN.read_bytes(), STOCK_BIN
+    else:
+        sys.exit(f"Stock image not found: put the decoded official image at {STOCK_BIN}, or pass --stock-hex")
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != STOCK_SHA256:
+        sys.exit(
+            f"{src}: stock image is {len(data)} bytes, sha256 {digest}; expected {STOCK_LEN} bytes, "
+            f"sha256 {STOCK_SHA256} (CM2856 v1.00.00 20220810). Only that firmware can be patched."
+        )
+    return data
 
 
 def encode_thumb2_bl(src_addr: int, dst_addr: int) -> bytes:
@@ -71,7 +122,7 @@ def decode_thumb2_bl(raw4: bytes, src_addr: int) -> int:
     return (src_addr + 4 + imm25) & 0xFFFFFFFF
 
 
-def build_patch() -> dict:
+def build_patch(stock_bin: bytes) -> dict:
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     elf_path = BUILD_DIR / "stock_ddpi_patch.elf"
     bin_path = BUILD_DIR / "stock_ddpi_patch.bin"
@@ -112,10 +163,6 @@ def build_patch() -> dict:
     print(f"[BUILD] Compiled OpenDDPIv1 patch payload: {len(patch_bytes)} bytes at 0x{PATCH_BASE:08X}..0x{PATCH_BASE + len(patch_bytes):08X}")
     for sym in ("ddpi_boot_init_wrapper", "ddpi_usb_protocol_wrapper", "ddpi_paw3370_burst_wrapper"):
         print(f"        Symbol {sym:<28} = 0x{symbols[sym]:08X}")
-
-    stock_bin_path = STOCK_DIR / "CM2856_Mouse_USB_v1.00.00_20220810.bin"
-    stock_bin = bytearray(stock_bin_path.read_bytes())
-    assert len(stock_bin) == 0x0001CC90 - APP_BASE, f"Unexpected stock bin length: {len(stock_bin)}"
 
     # Pad from 0x0001CC90 to 0x0001CD00 with 0xFF (erased flash)
     pad_len = PATCH_BASE - (APP_BASE + len(stock_bin))
@@ -166,56 +213,35 @@ def build_patch() -> dict:
         full_bin[file_off : file_off + len(expected)] = replacement
         print(f"        Patched {label:<20} @ 0x{addr:08X}: {expected_hex} -> {replacement.hex()}")
 
-    out_bin_path = BUILD_DIR / "CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.bin"
-    out_hex_path = BUILD_DIR / "CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.hex"
-    out_bin_path.write_bytes(full_bin)
-
-    # Convert to Intel HEX and run compx_hex_tool.py verification
-    if not (TOOLS_DIR / "compx_hex_tool.py").is_file():
-        sys.exit(
-            f"compx_hex_tool.py not found in {TOOLS_DIR}: clone "
-            "https://github.com/0zLloen/mouse-firmware-re next to this repo or set COMPX_TOOLS"
-        )
-    sys.path.insert(0, str(TOOLS_DIR))
-    import compx_hex_tool
-
+    # Convert to Intel HEX and run compx_hex_tool.py verification (nothing is written yet)
+    compx_hex_tool = import_compx_hex_tool()
     hex_text = compx_hex_tool.encode_compx_hex(bytes(full_bin), base_addr=APP_BASE)
-    out_hex_path.write_text(hex_text, encoding="ascii")
     res = compx_hex_tool.audit_binary_safety(bytes(full_bin), base_addr=APP_BASE)
     assert res["all_passed"], f"compx_hex_tool validation failed: {res}"
     print(
-        f"[BUILD] Created {out_hex_path.name} ({len(full_bin)} bytes, "
+        f"[BUILD] Image passes the compx_hex_tool audit ({len(full_bin)} bytes, "
         f"0x{APP_BASE:08X}..0x{APP_BASE + len(full_bin) - 1:08X}, SHA256={res['sha256'][:16]}...)"
     )
 
-    return {
-        "full_bin": bytes(full_bin),
-        "symbols": symbols,
-        "out_bin_path": out_bin_path,
-        "out_hex_path": out_hex_path,
-    }
+    return {"full_bin": bytes(full_bin), "hex_text": hex_text, "symbols": symbols}
 
 
 def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
-    try:
-        from unicorn import (
-            UC_ARCH_ARM,
-            UC_HOOK_CODE,
-            UC_MODE_THUMB,
-            UC_PROT_ALL,
-            Uc,
-        )
-        from unicorn.arm_const import (
-            UC_ARM_REG_LR,
-            UC_ARM_REG_PC,
-            UC_ARM_REG_R0,
-            UC_ARM_REG_R1,
-            UC_ARM_REG_R2,
-            UC_ARM_REG_SP,
-        )
-    except ImportError:
-        print("[UNICORN] Unicorn module not installed; skipping emulation.")
-        return
+    from unicorn import (
+        UC_ARCH_ARM,
+        UC_HOOK_CODE,
+        UC_MODE_THUMB,
+        UC_PROT_ALL,
+        Uc,
+    )
+    from unicorn.arm_const import (
+        UC_ARM_REG_LR,
+        UC_ARM_REG_PC,
+        UC_ARM_REG_R0,
+        UC_ARM_REG_R1,
+        UC_ARM_REG_R2,
+        UC_ARM_REG_SP,
+    )
 
     print("\n[UNICORN] Starting ARM Cortex-M4F instruction-level hardware emulation...")
 
@@ -236,6 +262,7 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
         "reset_called": False,
         "load_cfg_called": False,
         "paw3370_burst_called": False,
+        "erase_calls": 0,
         "sim_motion": 0,
         "sim_dx": 0,
         "sim_dy": 0,
@@ -263,6 +290,7 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
             # STOCK_FN_FLASH_ERASE_PAGE(r0 = page_addr)
             page_addr = uc.reg_read(UC_ARM_REG_R0)
             assert page_addr == 0x0007E000, f"Unexpected flash erase address: 0x{page_addr:08X}"
+            sim_state["erase_calls"] += 1
             uc.mem_write(page_addr, b"\xFF" * 4096)
             uc.reg_write(UC_ARM_REG_R0, 0)
             lr = uc.reg_read(UC_ARM_REG_LR)
@@ -342,12 +370,12 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
     print("  [PASS] Test 3: Stock USB FW Version Query @ 0x0000E8CE (executes real stock 0x151AC -> v1.0.0.0 + VID 2018 + stamps 'DP01')")
 
     # -------------------------------------------------------------------------
-    # TEST 4: Stock Bootloader Entry Command (feat[4]=0x00, feat[5]=0x00, feat[6]=0xB0) via 0x0000E8CE
+    # TEST 4: Stock Bootloader Entry Command (feat[3]=0x01, feat[6]=0xB0) via 0x0000E8CE
     # -------------------------------------------------------------------------
     sim_state["reset_called"] = False
     mu.mem_write(0x2003FFFC, struct.pack("<I", 0))
-    bl_req = bytearray(64)
-    bl_req[3] = 0x02
+    bl_req = bytearray(64)  # official updater packet (SetBLDeviceMode): command 0x00, mode 0xB0
+    bl_req[3] = 0x01
     bl_req[4] = 0x00
     bl_req[5] = 0x00
     bl_req[6] = 0xB0
@@ -356,10 +384,10 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
     call_bl_site_at(0x0000E8CE)
     magic = struct.unpack("<I", mu.mem_read(0x2003FFFC, 4))[0]
     assert sim_state["reset_called"] and magic == 0xA55AA55A
-    print("  [PASS] Test 4: Stock Bootloader Re-Entry (0x00, 0x00, 0xB0 -> executes real stock 0x1484C -> 0xA55AA55A)")
+    print("  [PASS] Test 4: Stock Bootloader Re-Entry (feat[3]=0x01, feat[6]=0xB0 -> executes real stock 0x1484C -> 0xA55AA55A)")
 
     # -------------------------------------------------------------------------
-    # TEST 5: OpenDDPIv1 GET_CAPABILITIES & SET_PROFILE + SAVE_FLASH via 0x0000E8CE
+    # TEST 5: OpenDDPIv1 GET_CAPABILITIES via 0x0000E8CE
     # -------------------------------------------------------------------------
     def crc16_ccitt(data: bytes) -> int:
         crc = 0xFFFF
@@ -393,6 +421,9 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
     assert struct.unpack_from("<H", cap_resp, 62)[0] == crc16_ccitt(cap_resp[:62])
     print("  [PASS] Test 5: OpenDDPIv1 GET_CAPABILITIES @ 0x0000E8CE (returns 'DP', status=0xA1, magic='DP01', valid CRC16)")
 
+    # -------------------------------------------------------------------------
+    # TEST 6: OpenDDPIv1 SET_PROFILE + SAVE_FLASH via 0x0000E8CE
+    # -------------------------------------------------------------------------
     # Configure asymmetric profile: East=1.00x (256), South=1.00x (256), West=1.00x (256), North=0.50x (128)
     # Note: In HID screen coords (+Y Down), North is -Y = 270 deg = octant 6!
     octants = [256, 256, 256, 256, 256, 256, 128, 256]
@@ -423,15 +454,22 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
     assert save_resp[0:2] == b"DP" and save_resp[3] == 0xA1
     flash_stored = bytes(mu.mem_read(0x0007E000, 28))
     assert flash_stored == prof_bytes
-    print("  [PASS] Test 6: OpenDDPIv1 SET_PROFILE & SAVE_FLASH @ 0x0000E8CE (persisted to Flash 0x0007E000)")
+    assert sim_state["erase_calls"] == 1
+
+    # An identical second save must not erase the page again (flash wear)
+    mu.mem_write(0x20004F28, save_req)
+    mu.mem_write(0x200032D4, b"\x01")
+    call_bl_site_at(0x0000E8CE)
+    save_resp = bytes(mu.mem_read(0x20006000, 64))
+    assert save_resp[0:2] == b"DP" and save_resp[3] == 0xA1
+    assert sim_state["erase_calls"] == 1, "identical SAVE_FLASH erased 0x7E000 again"
+    print("  [PASS] Test 6: OpenDDPIv1 SET_PROFILE & SAVE_FLASH @ 0x0000E8CE (persisted to Flash 0x0007E000; identical save skips the erase)")
 
     # -------------------------------------------------------------------------
     # TEST 7: Sensor Motion Burst Hook @ 0x000131D8 & 0x00013278
     # -------------------------------------------------------------------------
+    # Pure North (dx=0, dy=-100 -> octant 6 = 128 = 0.50x -> dy becomes -50)
     sim_state["sim_motion"] = 0x80
-    sim_state["sim_dx"] = 100
-    sim_state["sim_dy"] = -100  # 45 deg North-East (octant 1 = 1.0x -> Wait: octants=[256, 256, 128...])
-    # Wait: let's test pure North (dx=0, dy=-100 -> octant 2 = 128 = 0.50x -> dy should become -50!)
     sim_state["sim_dx"] = 0
     sim_state["sim_dy"] = -100
     call_bl_site_at(0x000131D8)
@@ -498,9 +536,67 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
         assert [c[0] >> 7 for c in chunks] == [1] * (expected_chunks - 1) + [0], "last chunk must end the reply"
     print("  [PASS] Test 9: 2.4 GHz reply capped at 64 bytes (status 0xA1/0xA4 -> 8 chunks; stock version reply -> 2)")
 
-    print("[UNICORN] All 9 instruction-level Cortex-M4F hardware emulation tests PASSED!")
+    # -------------------------------------------------------------------------
+    # TEST 10: Idle reset of the direction estimator, clocked by burst calls (1 per ms tick)
+    # -------------------------------------------------------------------------
+    # Travel window L = 16, idle 50 ms (default). East flick, k motion-free calls at the
+    # 0x13278 tick site, then one small North sample. Motion 50 calls after the last East
+    # sample (k = 49) starts fresh: pure North, 0.50x. At k = 48 the East window still wins: 1.00x.
+    mu.mem_write(0x20003003, b"\x02")  # back to wired mode
+    mu.mem_write(0x200035DE, b"\x00")
+    prof_body = struct.pack("<HBBHH8HH", 0x4450, 1, 0x01, 800, 256, *octants, 16)
+    mu.mem_write(0x20004F28, make_ddpi_req(0x03, prof_body + struct.pack("<H", crc16_ccitt(prof_body))))
+    mu.mem_write(0x200032D4, b"\x01")
+    call_bl_site_at(0x0000E8CE)
+    assert mu.mem_read(0x20006000, 4)[3] == 0xA1, "SET_PROFILE (L=16) failed"
+
+    def burst(motion: int, dx: int = 0, dy: int = 0) -> tuple:
+        sim_state["sim_motion"], sim_state["sim_dx"], sim_state["sim_dy"] = motion, dx, dy
+        call_bl_site_at(0x00013278)
+        return struct.unpack("<hh", mu.mem_read(0x2000302E, 4))
+
+    for idle_calls, expected_dy in ((49, -4), (48, -8)):
+        for _ in range(4):
+            burst(0x80, 20, 0)
+        for _ in range(idle_calls):
+            burst(0x00)
+        out = burst(0x80, 0, -8)
+        assert out == (0, expected_dy), f"{idle_calls} idle calls: North -8 -> {out}, expected (0, {expected_dy})"
+    print("  [PASS] Test 10: Idle reset after 50 burst calls (North -8 -> -4 after 49 idle calls; -8 after 48, still East)")
+
+    print("[UNICORN] All 10 instruction-level Cortex-M4F hardware emulation tests PASSED!")
+
+
+def main() -> None:
+    if sys.flags.optimize:
+        sys.exit("run without -O / PYTHONOPTIMIZE: the checks are assert statements")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--stock-hex", type=Path, help="official CM2856_Mouse_USB_v1.00.00_20220810.hex or a dump .hex "
+                    "of a mouse on stock v1.0.0.0 (compx_usb_flasher.py dump), instead of adapters/stock/*.bin")
+    args = ap.parse_args()
+
+    missing = [t for t in (ARM_GCC, ARM_OBJCOPY, ARM_NM, ARM_OBJDUMP) if shutil.which(t) is None]
+    if missing:
+        sys.exit(f"ARM toolchain not found: {', '.join(missing)}. Install arm-none-eabi-gcc "
+                 "(e.g. apt install gcc-arm-none-eabi) or set CROSS=/path/to/bin/arm-none-eabi-")
+    try:
+        import unicorn  # noqa: F401
+    except ImportError:
+        sys.exit("unicorn not installed (pip install unicorn): the emulation tests are required")
+
+    # A failed run must not leave a flashable image, old or new: write only after every check passed
+    out_bin_path = BUILD_DIR / "CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.bin"
+    out_hex_path = BUILD_DIR / "CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.hex"
+    for path in (out_bin_path, out_hex_path):
+        path.unlink(missing_ok=True)
+    info = build_patch(load_stock_image(args.stock_hex))
+    run_unicorn_verification(info["full_bin"], info["symbols"])
+    for path, data in ((out_bin_path, info["full_bin"]), (out_hex_path, info["hex_text"].encode("ascii"))):
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)  # never a half-written .hex under the final name
+    print(f"[BUILD] Wrote {out_bin_path} and {out_hex_path.name}")
 
 
 if __name__ == "__main__":
-    info = build_patch()
-    run_unicorn_verification(info["full_bin"], info["symbols"])
+    main()
