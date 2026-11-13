@@ -24,6 +24,8 @@ This section applies only to the Glorious Series One Pro (Compx CM2856).
 
 ### 2.1 How stock Compx firmware (`CM2856_Mouse_USB`) parses Feature reports
 From disassembly of `0x0001451C`–`0x00014AD0` in `CM2856_Mouse_USB_v1.00.00_20220810.hex` (65-byte buffer, `buf[0] = 0x00` Report ID, `buf[1..64]` payload):
+
+Two packets are verified on a retail mouse (2026-11-13), in payload indices (`feat[i] = buf[i+1]`): the firmware-version query `feat[3] = 0x06, feat[4] = 0x00, feat[5] = 0x81`, and the official updater's enter-bootloader packet `feat[3] = 0x01, feat[6] = 0xB0` (rest `0`, from `FirmwareUpdate.exe` `C52840Dongle::SetBLDeviceMode`). The dispatcher reading below is from disassembly and has not been re-checked against them.
 1. Stock firmware checks `buf[7] == 0xB0` (bootloader/version subcommands `0x80`, `0x81`, `0x04`).
 2. Otherwise it checks `buf[1]` (`0x00` = wired mouse target) and switches on **`buf[6]`**:
    - `0x01`: Read FW Version (`buf[7..8] = 0x81, 0x00` -> returns `[0x01, 0x00, 0x00, 0x00]` = `v1.0.0.0`)
@@ -40,7 +42,7 @@ Not re-verified: `adapters/glorious-cm2856/stock_ddpi_patch.c` and OpenMouse use
 ### 2.2 Safe detection for hosts
 A host must not send Open Directional DPI packets to a device that has not identified itself. OpenMouse (`detectCapabilities()` in `integrations/openmouse/src/directional-dpi.ts`):
 1. **Any device:** a USB product string containing `[OpenDDPIv1]` (e.g. `"My Mouse [OpenDDPIv1]"`). WebHID exposes no `bcdDevice`, so in a browser this is the only marker; Zephyr / ZMK / ZGM firmware sets it in its USB configuration (`adapters/zephyr/README.md`). Any other device without it is `"unsupported"` and gets no packet.
-2. **Glorious Series One Pro IDs only** (`258a:2018`, `258a:2031`): `bcdDevice >= 0x0201` also counts (stock reports `0x0101` wired / `0x0100` receiver). Otherwise the host sends the stock firmware-version query (§2.1, patch layout). The patch answers it unchanged and also writes `"DP01"` (`0x44, 0x50, 0x30, 0x31`) into payload bytes `16..19`, which stock firmware leaves `0`. No stamp: `"stock-glorious"`.
+2. **Glorious Series One Pro IDs only** (`258a:2018`, `258a:2031`): `bcdDevice >= 0x0201` also counts (stock reports `0x0101` wired / `0x0100` receiver). Otherwise the host sends the stock firmware-version query (§2.1, patch layout). The patch answers it unchanged and also writes `"DP01"` (`0x44, 0x50, 0x30, 0x31`) into payload bytes `16..19`, which stock firmware leaves `0`. No stamp: `"stock-glorious"`. Verified on a retail mouse (2026-11-13): stock v1.0.0.0 answers `a1 00 00 03 00 81 01 00 00 00 20 18` with bytes `16..19` zero; with the patch flashed the same reply carries `DP01` there, and `GET_CAPABILITIES` / `GET_PROFILE` answer with valid CRCs.
 3. **`GET_CAPABILITIES`** (§4.1) then confirms with the `"DP01"` magic.
 
 ---
