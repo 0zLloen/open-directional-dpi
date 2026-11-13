@@ -1,6 +1,6 @@
 # Porting the stock-firmware patch to another mouse
 
-The Glorious patch (`adapters/glorious-cm2856/`) is pinned to one stock image: `stock_ddpi_patch.c` and `build_and_verify_patch.py` hard-code its flash and SRAM addresses, and the build refuses any other image. A port to another stock firmware needs each item below, found in that firmware and checked the same way. The Glorious value is given for reference. No second mouse has been picked yet (2026-11-13).
+The Glorious patch ([`adapters/glorious-cm2856/`](../adapters/glorious-cm2856/README.md)) is pinned to one stock image: `stock_ddpi_patch.c` and `build_and_verify_patch.py` hard-code its flash and SRAM addresses, and the build refuses any other image. A port to another stock firmware needs each item below, found in that firmware and checked the same way. The Glorious value is given for reference. No second mouse has been picked yet (2026-11-13).
 
 Do the reverse engineering in [mouse-firmware-re](https://github.com/0zLloen/mouse-firmware-re) (its `CONTRIBUTING.md` safety ladder), with a `devices/<vendor>-<model>/` folder, and keep this repo to the patch.
 

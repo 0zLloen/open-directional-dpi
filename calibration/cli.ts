@@ -5,6 +5,7 @@
  * `tools/odd_profile.py load` accepts, or prints a profile JSON for another adapter:
  *
  *   node --experimental-strip-types calibration/cli.ts mouse-log mouse-log.csv --dpi 800 > profile.json
+ *   node --experimental-strip-types calibration/cli.ts aimlabs mouse-log.csv --dpi 800 > profile.json  (same as mouse-log)
  *   node --experimental-strip-types calibration/cli.ts kovaaks mouse-log.csv *Stats.csv --dpi 800 > profile.json
  *   node --experimental-strip-types calibration/cli.ts format profile.json --format qmk
  *
@@ -152,6 +153,7 @@ export const FORMATS: Record<string, (p: DdpiProfileV1) => string> = {
 /** provider -> [file arguments, parser of those files' contents] */
 const PROVIDERS: Record<string, [string, (texts: string[]) => SubmovementAnalysis[]]> = {
   "mouse-log": ["<mouse-log.csv>", ([log]) => ingestMouseLog(log!)],
+  aimlabs: ["<mouse-log.csv>", ([log]) => ingestMouseLog(log!)], // mouse-log under the trainer's name (SpiderShot)
   kovaaks: ["<mouse-log.csv> <Stats.csv>...", ([log, ...stats]) => ingestKovaaks(log!, stats)],
 };
 

@@ -29,7 +29,7 @@ type Device = {
 type Client = { dev: Device; relay: boolean; seq: number; onWait?: () => void };
 type ProfileDoc = Record<string, unknown>;
 
-const html = readFileSync(new URL("../providers/builtin/calibrate.html", import.meta.url), "utf8");
+const html = readFileSync(new URL("../../web/calibrate.html", import.meta.url), "utf8");
 const exportSrc = /\/\/ --- profile export[^\n]*\n([\s\S]*?)\/\/ --- end profile export ---/.exec(html)?.[1];
 const clientSrc = /\/\/ --- BEGIN webhid client[^\n]*\n([\s\S]*?)\/\/ --- END webhid client ---/.exec(html)?.[1];
 assert.ok(exportSrc && clientSrc, "marked blocks not found in calibrate.html");

@@ -78,16 +78,19 @@ What the board does:
 
 Hosts:
 - `integrations/openmouse` (WebHID, Chrome or Edge): open the device with the filter `QMK_RAW_HID_FILTER` (`{ usagePage: 0xff60, usage: 0x61 }`) and pass it to `OpenMouseDirectionalDpiClient`; `detectCapabilities()` sends the probe. Tested against a mock board only.
-- `tools/odd_profile.py` (Linux hidraw, or hidapi on any OS): finds the `0xFF60`/`0x61` interface and probes it only when no mouse is found or `--device` names it. Tested against fake boards only.
+- `tools/odd_profile.py` (Linux hidraw, or hidapi on any OS; both backends speak raw HID):
+  - It finds the `0xFF60`/`0x61` interface and probes it with `GET_CAPABILITIES` only when no mouse is found or `--device` names it, and sends nothing else unless the answer carries `DP01`. A VIA or Vial board without the adapter answers `0xFF` to the first frame and the probe stops.
+  - A raw HID interface that does not open (no access, or held by another program) is skipped and named in the "No supported device found" message, unless `--device` names it.
+  - Only checked against fakes (2026-11-13); no board has run it.
 - `calibrate.html` (**Send to mouse**) does not speak raw HID yet: it uses the Feature report only.
 - Close the VIA or Vial app while configuring: it reads replies from the same interface.
 
 ## Compile check without QMK
 
-CI compiles the adapter against its stand-in types and against QMK 0.34.8's own `report.h`, `pointing_device.h`, `timer.h`, `eeconfig.h` and `raw_hid.h` (headers only), with and without `RAW_ENABLE`, and `odd_raw_hid.c` for raw HID alone, VIA and Vial. `make -C tests test` runs the raw HID framing, the probe answer and `SAVE_FLASH` on the host (`tests/test_qmk_raw_hid.c`). Not yet built in a QMK keyboard or run on a QMK device; the keymap snippet above is not compiled in CI.
+From the repo root:
 
 ```sh
-gcc -std=c11 -Wall -Wextra -Werror -pedantic -c odd_pointing_device.c -o /dev/null
-gcc -std=c11 -Wall -Wextra -Werror -pedantic -DMOUSE_EXTENDED_REPORT -c odd_pointing_device.c -o /dev/null
-gcc -std=c11 -Wall -Wextra -Werror -pedantic -DRAW_ENABLE -c odd_pointing_device.c -o /dev/null
+make -C adapters/qmk check
 ```
+
+It builds [`tests/test_qmk_raw_hid.c`](tests/test_qmk_raw_hid.c), compiles `odd_pointing_device.c` with the adapter's stand-in types three times (8-bit reports, `MOUSE_EXTENDED_REPORT`, `RAW_ENABLE`), then runs the test: the raw HID framing, the probe answer and `SAVE_FLASH` on the host. CI runs it, and also compiles the adapter against QMK 0.34.8's own `report.h`, `pointing_device.h`, `timer.h`, `eeconfig.h` and `raw_hid.h` (headers only), with and without `RAW_ENABLE`, and `odd_raw_hid.c` for raw HID alone, VIA and Vial. Not yet built in a QMK keyboard or run on a QMK device; the keymap snippet above is not compiled in CI.

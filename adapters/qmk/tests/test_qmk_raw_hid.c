@@ -21,7 +21,7 @@ static uint32_t eeconfig_update_user_datablock(const void *data, uint32_t offset
     memcpy(&g_eeprom[offset], data, length);
     return length;
 }
-#include "../adapters/qmk/odd_pointing_device.c"
+#include "../odd_pointing_device.c"
 
 /* One frame as QMK's raw_hid_receive() gets it; returns the adapter's verdict, reply in f */
 static bool frame(uint8_t f[32], uint8_t chunk, const uint8_t *data, size_t n) {
