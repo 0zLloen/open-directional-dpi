@@ -5,7 +5,9 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   clampDpi,
   computeDirectionalScaleQ16_16,
@@ -469,7 +471,40 @@ async function runTests(): Promise<void> {
     console.log("  [PASS] 18. Single DPI stage flag (JSON) and sensor DPI in capabilities");
   }
 
-  console.log("\nAll 18/18 OpenMouse integration test suites passed.");
+  {
+    /* 19. tools/odd_profile.py encodes and decodes exactly like importProfileJson / exportProfileJson */
+    const tool = fileURLToPath(new URL("../../../tools/odd_profile.py", import.meta.url));
+    const py = (...args: string[]): string => execFileSync("python3", ["-I", tool, ...args], { encoding: "utf8" });
+    const docs: Record<string, unknown>[] = [
+      JSON.parse(exportProfileJson(createDefaultProfileV1(800))),
+      {
+        schema: "open-directional-dpi-v1", version: 1, enabled: true, frame: "odd-sensor-ccw", model: "angular-gain",
+        windowCounts: 31, idleResetMs: 50, onlyAtBaseDpi: true, baseDpi: 1600, globalGain: 1.03125,
+        directionalMultipliers: { E_0: 1, SE_45: 0.9, S_90: 0.8125, SW_135: 0.95, W_180: 1.25, NW_225: 0.0625, N_270: 4, NE_315: 0.33333 },
+      },
+      {
+        schema: "open-directional-dpi-v1", version: 1, enabled: true, model: "linear-2x2", resetRemainderOnReverse: true,
+        linearOctantRatio: true, keepRemainderOnReverse: true, baseDpi: 26000, globalGain: 0.75,
+        directionalMultipliers: { E_0: 1.1, SE_45: 1.2, S_90: 1.3, SW_135: 1.4, W_180: 1.5, NW_225: 1.6, N_270: 1.7, NE_315: 1.8 },
+      },
+    ];
+    for (const doc of docs) {
+      const json = JSON.stringify(doc);
+      const ts = Buffer.from(serializeProfileV1(importProfileJson(json))).toString("hex");
+      const file = `${tool}.parity-${process.pid}.json`;
+      writeFileSync(file, json);
+      try {
+        assert.equal(py("encode", file).trim(), ts, `encode differs for ${json}`);
+      } finally {
+        unlinkSync(file);
+      }
+      assert.deepEqual(JSON.parse(py("decode", ts)), JSON.parse(exportProfileJson(importProfileJson(json))));
+    }
+    assert.throws(() => py("encode", "/nonexistent.json"), "missing file must fail");
+    console.log("  [PASS] 19. tools/odd_profile.py matches the TypeScript JSON mapping byte for byte");
+  }
+
+  console.log("\nAll 19/19 OpenMouse integration test suites passed.");
 }
 
 runTests().catch((err) => {

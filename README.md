@@ -19,6 +19,7 @@ Notes:
 - Glorious patch: `make -C adapters/glorious-cm2856 check` only compiles and links the patch. The full build (`build_and_verify_patch.py`) also needs the user-supplied stock image in `adapters/stock/` (not in the repo) and `compx_hex_tool.py` from [mouse-firmware-re](https://github.com/0zLloen/mouse-firmware-re), cloned next to this repo or pointed to with `COMPX_TOOLS=<path to platforms/compx-nrf52/tools>`. That repo also holds the Compx USB flasher and the reverse-engineering notes for this mouse.
   - Stock image: `compx_hex_tool.py decode --target mouse -o adapters/stock/CM2856_Mouse_USB_v1.00.00_20220810.bin <official CM2856_Mouse_USB_v1.00.00_20220810.hex>`. The official package is no longer downloadable from Glorious; its SHA-256 is in mouse-firmware-re.
   - Checked against the real stock image (2026-11-13): all four hook sites call the expected stock functions, and the 7 Unicorn emulation tests pass (`pip install unicorn`).
+  - Profiles: `python3 tools/odd_profile.py load profile.json --save` (the JSON from `calibrate.html` or OpenMouse), `info` shows the current DPI and profile, `export` and `reset` do what they say. Configuration works over the cable; the 2.4 GHz receiver path is untested.
   - Flash: back up first with `compx_usb_flasher.py dump --out backup.hex`, then `compx_usb_flasher.py flash --firmware-hex adapters/build/CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.hex`. The USB backup cannot reach the pairing pages (0x88000+), and the bootloader's `Erase` extent is unknown.
   - Flashed on a retail mouse (2026-11-13) with the read-back-verified flasher from mouse-firmware-re: it boots, the version reply carries `DP01`, and `GET_CAPABILITIES` / `GET_PROFILE` answer. With a RAM-only profile (up at 0.50x, window 0), up-and-down hand motion went from an up/down count ratio of 0.913 to 0.618, and `SIMULATE_DELTA` with the sensor idle matched the C engine bit for bit. `SAVE_FLASH` writes the profile to `0x7E000`: it survived a reboot and two full USB flashes (stock image restored, then the patch flashed again), so the bootloader's `Erase` leaves that page alone. Rolling back with the official `.hex` was verified the same way. Not yet tested on hardware: the boot-chord recovery. This mouse has no idle reset of the direction estimator yet (no verified stock millisecond tick).
 - Zephyr: setup, devicetree properties and the HID hook are in [`adapters/zephyr/README.md`](adapters/zephyr/README.md).
@@ -64,6 +65,8 @@ open-directional-dpi/
 │       ├── src/directional-dpi.ts   # TypeScript codec, scale mirror, JSON import/export, WebHID client
 │       ├── src/mock-hid.ts          # Mock Glorious device (stock and custom firmware) for tests
 │       └── test/                    # C-vector parity, JSON and mock-HID tests
+├── tools/
+│   └── odd_profile.py               # Load / save / export profiles on a mouse (Linux hidraw, stdlib only)
 ├── zephyr/
 │   └── module.yml                   # Makes the repo root a Zephyr module (`open-directional-dpi`)
 ├── .github/workflows/
@@ -103,7 +106,7 @@ make -C tests test
 # Conformance vectors: regenerate from the engine; the diff must be empty
 make -C tests vectors && git diff --exit-code -- tests/vectors
 
-# TypeScript (Node >= 22.6): 17 OpenMouse suites incl. C-vector parity, then 4 calibration suites
+# TypeScript (Node >= 22.6): 19 OpenMouse suites incl. C-vector and odd_profile.py parity, then 4 calibration suites
 node --experimental-strip-types --test integrations/openmouse/test/directional-dpi.test.ts
 node --experimental-strip-types --test calibration/tests/calibration.test.ts
 
