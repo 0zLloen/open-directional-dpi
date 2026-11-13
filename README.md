@@ -19,7 +19,7 @@ Notes:
 - Glorious patch: `make -C adapters/glorious-cm2856 check` only compiles and links the patch. The full build (`build_and_verify_patch.py`) also needs the user-supplied stock image in `adapters/stock/` (not in the repo) and `compx_hex_tool.py` from [mouse-firmware-re](https://github.com/0zLloen/mouse-firmware-re), cloned next to this repo or pointed to with `COMPX_TOOLS=<path to platforms/compx-nrf52/tools>`. That repo also holds the Compx USB flasher and the reverse-engineering notes for this mouse.
   - Stock image: `compx_hex_tool.py decode --target mouse -o adapters/stock/CM2856_Mouse_USB_v1.00.00_20220810.bin <official CM2856_Mouse_USB_v1.00.00_20220810.hex>`. The official package is no longer downloadable from Glorious; its SHA-256 is in mouse-firmware-re.
   - Checked against the real stock image (2026-11-13): all four hook sites call the expected stock functions, and the 9 Unicorn emulation tests pass (`pip install unicorn`), including the 2.4 GHz relay and the 64-byte reply cap.
-  - Profiles: `python3 tools/odd_profile.py load profile.json --save` (the JSON from `calibrate.html` or OpenMouse), `info` shows the current DPI and profile, `export` and `reset` do what they say. It works over the cable and through the 2.4 GHz receiver (`258a:2031`, verified 2026-11-13: info, load, save, export, reset; the receiver's own queries still answer normally afterwards). The receiver path needs a patch build from after 2026-11-13; OpenMouse (WebHID) does not use it yet.
+  - Profiles: `python3 tools/odd_profile.py load profile.json --save` (the JSON from `calibrate.html`, `calibration/cli.ts` or OpenMouse), `info` shows the current DPI and profile, `export` and `reset` do what they say. It works over the cable and through the 2.4 GHz receiver (`258a:2031`, verified 2026-11-13: info, load, save, export, reset; the receiver's own queries still answer normally afterwards). The receiver path needs a patch build from after 2026-11-13; OpenMouse (WebHID) does not use it yet.
   - Flash: back up first with `compx_usb_flasher.py dump --out backup.hex`, then `compx_usb_flasher.py flash --firmware-hex adapters/build/CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.hex`. The USB backup cannot reach the pairing pages (0x88000+), and the bootloader's `Erase` extent is unknown.
   - Flashed on a retail mouse (2026-11-13) with the read-back-verified flasher from mouse-firmware-re: it boots, the version reply carries `DP01`, and `GET_CAPABILITIES` / `GET_PROFILE` answer. With a RAM-only profile (up at 0.50x, window 0), up-and-down hand motion went from an up/down count ratio of 0.913 to 0.618, and `SIMULATE_DELTA` with the sensor idle matched the C engine bit for bit. `SAVE_FLASH` writes the profile to `0x7E000`: it survived a reboot and two full USB flashes (stock image restored, then the patch flashed again), so the bootloader's `Erase` leaves that page alone. Rolling back with the official `.hex` was verified the same way. Not yet tested on hardware: the boot-chord recovery. This mouse has no idle reset of the direction estimator yet (no verified stock millisecond tick).
 - Zephyr: setup, devicetree properties and the HID hook are in [`adapters/zephyr/README.md`](adapters/zephyr/README.md).
@@ -50,11 +50,11 @@ open-directional-dpi/
 │   │   └── profile-generation/      # Smoothed gains, CPI headroom & signed firmware profile
 │   ├── providers/
 │   │   ├── builtin/                 # calibrate.html (Pointer Lock calibration page) & scheduler
-│   │   ├── aimfroge/                # AimFroge open aim-trainer telemetry adapter
-│   │   ├── kovaaks/                 # KovaaK's directional flick CSV parser
-│   │   └── aimlabs/                 # Aimlabs SpiderShot / Mouselabs export importer
-│   └── tests/
-│       └── calibration.test.ts      # Calibration pipeline & provider tests
+│   │   ├── mouse-log/               # Raw mouse log (MouseTester CSV) -> click-to-click flicks; Linux evdev logger
+│   │   └── kovaaks/                 # Mouse log filtered by KovaaK's Stats.csv kills
+│   ├── cli.ts                       # Provider -> open-directional-dpi-v1 profile JSON
+│   ├── README.md                    # How to calibrate from Aimlabs / KovaaK's; what the trainers export
+│   └── tests/                       # Pipeline and provider tests, fixtures
 ├── adapters/
 │   ├── glorious-cm2856/             # Stock-firmware patch (`stock_ddpi_patch.c/.ld`, `make check`)
 │   ├── zephyr/                      # Zephyr / ZMK / Keychron ZGM input filter (`odd,directional-dpi`)
@@ -91,6 +91,7 @@ open-directional-dpi/
    - Computes $\text{sensor\_cpi} = \operatorname{round}(\text{base\_cpi} \times \max G)$ and normalizes the multipliers to $\le 1.00\times$, so firmware only scales down and never emits 2-count steps.
 4. **Browser calibration (`calibration/providers/builtin/calibrate.html`):**
    - Uses `requestPointerLock({ unadjustedMovement: true })` to measure primary-submovement overshoot/undershoot in 8 directions and exports an `open-directional-dpi-v1` JSON profile that OpenMouse `importProfileJson` accepts.
+   - Aim trainers (Aimlabs SpiderShot, KovaaK's): `calibration/cli.ts` makes the same JSON from a raw mouse log recorded while playing; see [`calibration/README.md`](calibration/README.md) for the steps and what each trainer exports.
    - Calibrate with the curve off: the page sees motion after the mouse (or host filter) applied the active curve, and exports absolute gains, so a recalibration through an active curve undoes the previous one. HID mice: `bypassForCalibration()` in OpenMouse (exact 1.00x, end it with `setEnabled()`) or disable the curve. evdev: stop the filter. QMK / devicetree curves: flash a flat curve first.
 5. **Conformance vectors (`tests/vectors/`):** 2592 scale/octant results from the C engine; the TypeScript mirror must match every one.
 6. **Single DPI stage (like Corsair PureVector):** a profile with `onlyAtBaseDpi` (flag bit 7) applies only while the sensor runs at its `baseDpi`; every other DPI stage passes through unchanged. It needs firmware that reports the current DPI: the Glorious patch (reads the stock firmware's active DPI) and QMK (`pointing_device_get_cpi()`). Elsewhere the flag has no effect and the curve applies at every DPI. In `calibrate.html`, tick "Only at this DPI" and enter that stage's DPI as the base CPI.
@@ -106,9 +107,9 @@ make -C tests test
 # Conformance vectors: regenerate from the engine; the diff must be empty
 make -C tests vectors && git diff --exit-code -- tests/vectors
 
-# TypeScript (Node >= 22.6): 19 OpenMouse suites incl. C-vector and odd_profile.py parity, then 4 calibration suites
+# TypeScript (Node >= 22.6): 19 OpenMouse suites incl. C-vector and odd_profile.py parity, then the calibration and provider tests
 node --experimental-strip-types --test integrations/openmouse/test/directional-dpi.test.ts
-node --experimental-strip-types --test calibration/tests/calibration.test.ts
+node --experimental-strip-types --test calibration/tests/*.test.ts
 
 # Linux evdev filter: build and self-test (no root or /dev/uinput needed)
 make -C adapters/linux-evdev check
