@@ -1,8 +1,11 @@
 /**
  * OpenMouse — Open Directional DPI v1 Protocol Client, Editor Model & Serializer
  *
- * Compatible with Glorious Forge Series One Pro (258a:2018 wired / 258a:2031 wireless)
+ * Compatible with the Glorious Forge Series One Pro running the stock-firmware patch, by
+ * cable (258a:2018) or through its 2.4 GHz receiver (258a:2031, spec/hid-protocol-v1.md §2.3),
  * and any mouse firmware implementing Open Directional DPI v1 (spec/directional-dpi-v1.md).
+ * Verified: the same packets from tools/odd_profile.py on a retail mouse, both routes
+ * (2026-11-13). Not yet run over WebHID on hardware; tested against mock-hid.ts only.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -159,7 +162,6 @@ export interface WebHidFeatureTransport {
   readonly vendorId: number;
   readonly productId: number;
   readonly productName: string;
-  readonly bcdDevice?: number;
   sendFeatureReport(reportId: number, data: Uint8Array): Promise<void>;
   receiveFeatureReport(reportId: number): Promise<DataView>;
 }
@@ -343,8 +345,8 @@ export function computeDirectionalScaleQ16_16(
 
   const ax = Math.abs(dx);
   const ay = Math.abs(dy);
-  let cardIdx = DdpiDirection.E;
-  let diagIdx = DdpiDirection.SE;
+  let cardIdx: DdpiDirection = DdpiDirection.E;
+  let diagIdx: DdpiDirection = DdpiDirection.SE;
   let octant = 0;
   let u = ax;
   let v = ay;
@@ -608,9 +610,24 @@ export function computePolarCurve360(
   return points;
 }
 
-/* GET_REPORT retries while a device is still processing a request (~300 ms) */
-const ANSWER_POLLS = 30;
+/* GET_REPORT is retried until this deadline: through the 2.4 GHz receiver SAVE_FLASH
+ * answers after ~770 ms (spec/hid-protocol-v1.md §2.3) */
+const ANSWER_DEADLINE_MS = 2000;
 const ANSWER_POLL_MS = 10;
+
+/**
+ * Of the Glorious devices a host can open, the cable (258a:2018) wins over the
+ * 2.4 GHz receiver (258a:2031) when both are present, as in tools/odd_profile.py.
+ */
+export function preferCable<T extends { vendorId: number; productId: number }>(
+  devices: readonly T[]
+): T | undefined {
+  return (
+    devices.find(
+      (d) => d.vendorId === GLORIOUS_VID && d.productId === SERIES_ONE_PRO_WIRED_PID
+    ) ?? devices[0]
+  );
+}
 
 /**
  * OpenMouse WebHID Protocol Client for Open Directional DPI v1.
@@ -627,14 +644,24 @@ export class OpenMouseDirectionalDpiClient {
     this.transport = transport;
   }
 
+  /** The Glorious 2.4 GHz receiver relays requests to the mouse (spec/hid-protocol-v1.md §2.3) */
+  private get relay(): boolean {
+    return (
+      this.transport.vendorId === GLORIOUS_VID &&
+      this.transport.productId === SERIES_ONE_PRO_WIRELESS_PID
+    );
+  }
+
   /**
    * Detect whether the device speaks Open Directional DPI v1 (spec/hid-protocol-v1.md §2.2).
    *
    * Safety Rule: no Open Directional DPI packet goes to a device that has not
    * identified itself first: product string "[OpenDDPIv1]" (any device), or for
-   * the Glorious Series One Pro IDs only, bcdDevice >= 0x0201 or the "DP01" stamp
-   * the stock-firmware patch adds to the stock firmware-version answer.
+   * the Glorious Series One Pro IDs only, the "DP01" stamp the stock-firmware
+   * patch adds to the stock firmware-version answer (through the receiver: the
+   * relayed query and the stamp at 12..15, §2.3).
    * Otherwise returns "stock-glorious" / "unsupported".
+   * Throws if the receiver cannot reach the mouse.
    */
   async detectCapabilities(): Promise<DdpiDeviceCapabilities> {
     const t = this.transport;
@@ -644,9 +671,7 @@ export class OpenMouseDirectionalDpiClient {
         t.productId === SERIES_ONE_PRO_WIRELESS_PID);
     const speaksOdd =
       t.productName.includes("[OpenDDPIv1]") ||
-      (glorious &&
-        ((t.bcdDevice !== undefined && t.bcdDevice >= 0x0201) ||
-          (await this.gloriousVersionHasPatchStamp())));
+      (glorious && (await this.gloriousVersionHasPatchStamp()));
 
     if (!speaksOdd) {
       return {
@@ -657,7 +682,7 @@ export class OpenMouseDirectionalDpiClient {
         wired1000Hz: glorious,
         nvsStorage: false,
         paw3370Sensor: glorious,
-        bootloaderReentry: glorious,
+        bootloaderReentry: glorious && !this.relay, // the Compx bootloader is USB only
         minDpi: glorious ? 50 : 0,
         maxDpi: glorious ? 19000 : 0,
         minMultiplierQ8_8: DDPI_Q8_8_ONE,
@@ -690,7 +715,7 @@ export class OpenMouseDirectionalDpiClient {
       wired1000Hz: (hwFlags & 0x01) !== 0,
       nvsStorage: (hwFlags & 0x02) !== 0,
       paw3370Sensor: (hwFlags & 0x04) !== 0,
-      bootloaderReentry: (hwFlags & 0x08) !== 0,
+      bootloaderReentry: !this.relay && (hwFlags & 0x08) !== 0, // enterBootloader() needs the cable
       minDpi: dv.getUint16(16, true),
       maxDpi: dv.getUint16(18, true),
       minMultiplierQ8_8: dv.getUint16(20, true),
@@ -730,6 +755,11 @@ export class OpenMouseDirectionalDpiClient {
     return (resp[8]! & DDPI_FLAG_ENABLED) !== 0;
   }
 
+  /**
+   * Persist the active profile. Call it only on an explicit user action (a Save
+   * button), never on every edit: on the Glorious every save erases a flash page,
+   * and through the 2.4 GHz receiver the answer takes ~770 ms.
+   */
   async saveToFlash(slot = 0): Promise<DdpiProfileV1> {
     const resp = await this.sendCommand(
       DdpiHidOpcode.SAVE_FLASH,
@@ -777,6 +807,9 @@ export class OpenMouseDirectionalDpiClient {
   }
 
   async enterBootloader(): Promise<void> {
+    if (this.relay) {
+      throw new Error("ENTER_BOOTLOADER needs the cable: the Compx bootloader is USB only");
+    }
     const payload = new Uint8Array(4);
     new DataView(payload.buffer).setUint32(
       0,
@@ -810,6 +843,11 @@ export class OpenMouseDirectionalDpiClient {
     const reqCrc = crc16Ccitt(pkt, 62);
     pkt[62] = reqCrc & 0xff;
     pkt[63] = (reqCrc >> 8) & 0xff;
+    if (this.relay) {
+      /* Relay envelope (§2.3): target mouse, forward 0x3A + 6 = 64 bytes; outside the CRC */
+      pkt[2] = 0x02;
+      pkt[3] = 0x3a;
+    }
 
     await this.transport.sendFeatureReport(0x00, pkt);
     /* Only the answer echoing this seq and opcode counts; until it is ready the
@@ -829,7 +867,7 @@ export class OpenMouseDirectionalDpiClient {
     if (resp === undefined) {
       if (mayNotAnswer) return new Uint8Array(0);
       throw new Error(
-        `No answer to opcode 0x${opcode.toString(16)} within ${ANSWER_POLLS * ANSWER_POLL_MS} ms`
+        `No answer to opcode 0x${opcode.toString(16)} within ${ANSWER_DEADLINE_MS} ms`
       );
     }
     const expCrc = crc16Ccitt(resp, 62);
@@ -847,41 +885,52 @@ export class OpenMouseDirectionalDpiClient {
 
   /**
    * GET_REPORT(Feature 0), without a leading Report ID, until `isAnswer` accepts
-   * it; undefined if it never does. The Glorious patch answers from the main loop
-   * (via the 2.4 GHz receiver: after a radio round trip, and SAVE_FLASH erases a
-   * flash page first), so the first GET_REPORT can return the previous answer.
+   * it; undefined if it never does within ANSWER_DEADLINE_MS. The Glorious patch
+   * answers from the main loop (via the 2.4 GHz receiver: after a radio round
+   * trip, and SAVE_FLASH erases a flash page first), so the first GET_REPORT can
+   * return the previous answer. The receiver shows 0xA0 while a request is pending
+   * and 0xA4 while the link is down; 0xA4 can be transient (SAVE_FLASH), so only
+   * a 0xA4 at the deadline means the mouse is unreachable.
    */
   private async pollAnswer(
     isAnswer: (resp: Uint8Array) => boolean
   ): Promise<Uint8Array | undefined> {
-    for (let i = 0; i <= ANSWER_POLLS; i++) {
+    const deadline = Date.now() + ANSWER_DEADLINE_MS;
+    for (let i = 0; ; i++) {
       if (i > 0) await new Promise((r) => setTimeout(r, ANSWER_POLL_MS));
       const dv = await this.transport.receiveFeatureReport(0x00);
       const raw = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
       /* Strip leading Report ID 0x00 if WebHID/HIDAPI returned 65 bytes */
       const resp = raw.length === 65 && raw[0] === 0x00 ? raw.subarray(1, 65) : raw;
       if (isAnswer(resp)) return resp;
+      if (Date.now() >= deadline) {
+        if (this.relay && resp[0] === 0xa4) {
+          throw new Error(
+            "The 2.4 GHz receiver cannot reach the mouse (switched off, asleep or out of range)"
+          );
+        }
+        return undefined;
+      }
     }
-    return undefined;
   }
 
   /**
-   * Stock Glorious firmware-version query, in the layout stock_ddpi_patch.c
-   * matches ([3] = 0x06, [4] = 0x00, [5] = 0x81). Stock firmware just answers it;
-   * the patch also writes "DP01" into [16..19] of the answer.
+   * Stock Glorious firmware-version query ([4] = 0x00, [5] = 0x81), which
+   * stock_ddpi_patch.c stamps with "DP01". Stock firmware just answers it.
+   * Cable: [3] = 0x06, stamp at [16..19]. Receiver (§2.3): [2] = 0x02 relays it to
+   * the mouse and [3] = 0x0A copies back 16 bytes; only patch builds that
+   * understand the relay envelope also stamp [12..15].
    */
   private async gloriousVersionHasPatchStamp(): Promise<boolean> {
     const req = new Uint8Array(DDPI_HID_PACKET_LENGTH);
-    req[3] = 0x06;
-    req[5] = 0x81;
+    req.set(this.relay ? [0x02, 0x0a, 0x00, 0x81] : [0x00, 0x06, 0x00, 0x81], 2);
     await this.transport.sendFeatureReport(0x00, req);
-    const stamped = (r: Uint8Array): boolean =>
-      String.fromCharCode(...r.subarray(16, 20)) === "DP01";
-    /* Stops at the stamp or at a finished answer echoing the query; stock
-     * firmware that does not echo it costs the whole poll budget */
+    /* A finished answer echoes the query; stock firmware that does not echo it
+     * costs the whole deadline */
     const resp = await this.pollAnswer(
-      (r) => stamped(r) || (r[0] === 0xa1 && r[4] === 0x00 && r[5] === 0x81)
+      (r) => r[0] === 0xa1 && r[4] === 0x00 && r[5] === 0x81
     );
-    return resp !== undefined && stamped(resp);
+    const at = this.relay ? 12 : 16;
+    return resp !== undefined && String.fromCharCode(...resp.subarray(at, at + 4)) === "DP01";
   }
 }
