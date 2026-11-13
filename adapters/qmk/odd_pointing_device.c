@@ -10,7 +10,7 @@
 #include "../../core/directional_dpi.h"
 
 #ifdef QMK_KEYBOARD_H
-#include QMK_KEYBOARD_H /* report_mouse_t, CONSTRAIN_HID_XY, timer_read32 */
+#include QMK_KEYBOARD_H /* report_mouse_t, CONSTRAIN_HID_XY, timer_read32, pointing_device_get_cpi */
 #else
 /* Standalone compile check only: the few QMK names this file uses (tmk_core/protocol/report.h). */
 #ifdef MOUSE_EXTENDED_REPORT
@@ -32,6 +32,9 @@ typedef struct {
 } report_mouse_t;
 static uint32_t timer_read32(void) {
     return 0u;
+}
+static uint16_t pointing_device_get_cpi(void) {
+    return 800u;
 }
 #endif
 
@@ -58,6 +61,9 @@ report_mouse_t pointing_device_task_odd(report_mouse_t mouse_report) {
     }
     int16_t out_x = 0;
     int16_t out_y = 0;
+    /* QMK owns the CPI (DPI keycodes, pointing_device_set_cpi): lets a profile with
+     * DDPI_FLAG_ONLY_AT_BASE_DPI apply to one DPI stage only */
+    ddpi_engine_set_sensor_dpi(&g_odd_qmk_engine, pointing_device_get_cpi());
     ddpi_process_motion(&g_odd_qmk_engine, (int16_t)mouse_report.x, (int16_t)mouse_report.y,
                         timer_read32(), &out_x, &out_y);
     /* 8-bit reports (no MOUSE_EXTENDED_REPORT) would wrap; saturate instead.

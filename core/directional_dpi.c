@@ -277,6 +277,7 @@ void ddpi_engine_init(ddpi_engine_t *engine, uint16_t base_dpi) {
     engine->last_octant       = 0u;
     engine->last_scale_q16_16 = DDPI_Q16_16_ONE;
     engine->last_motion_ms    = 0u;
+    engine->sensor_dpi        = 0u;
 }
 
 void ddpi_engine_reset_remainders(ddpi_engine_t *engine) {
@@ -287,6 +288,22 @@ void ddpi_engine_reset_remainders(ddpi_engine_t *engine) {
     engine->rem_y_q16_16 = 0;
     engine->dir_x_q16_16 = 0;
     engine->dir_y_q16_16 = 0;
+}
+
+void ddpi_engine_set_sensor_dpi(ddpi_engine_t *engine, uint16_t sensor_dpi) {
+    if (engine == NULL || engine->sensor_dpi == sensor_dpi) {
+        return;
+    }
+    ddpi_engine_reset_remainders(engine);
+    engine->sensor_dpi = sensor_dpi;
+}
+
+/* Curve off: identity profile, or bound to another DPI stage than the current one */
+static bool ddpi_curve_off(const ddpi_engine_t *engine) {
+    const ddpi_profile_v1_t *p = &engine->profile;
+    return ddpi_profile_is_identity(p) ||
+           ((p->flags & DDPI_FLAG_ONLY_AT_BASE_DPI) != 0u && engine->sensor_dpi != 0u &&
+            engine->sensor_dpi != p->base_dpi);
 }
 
 void ddpi_engine_notify_idle(ddpi_engine_t *engine) {
@@ -566,8 +583,9 @@ void ddpi_process_delta(
         return;
     }
 
-    /* Exact 1.00x bypass when disabled, in calibration bypass, or all multipliers == 1.00x */
-    if (ddpi_profile_is_identity(&engine->profile)) {
+    /* Exact 1.00x bypass when disabled, in calibration bypass, all multipliers == 1.00x,
+     * or the profile is bound to another DPI stage (DDPI_FLAG_ONLY_AT_BASE_DPI) */
+    if (ddpi_curve_off(engine)) {
         engine->last_scale_q16_16 = DDPI_Q16_16_ONE;
         *out_dx = (in_dx < -32767) ? -32767 : in_dx;
         *out_dy = (in_dy < -32767) ? -32767 : in_dy;
@@ -689,13 +707,15 @@ bool ddpi_hid_handle_feature_report(
             payload[7] = (uint8_t)((on_save_flash != NULL ? 0x02u : 0u) |       /* nvs_storage */
                                    (on_enter_bootloader != NULL ? 0x08u : 0u) | /* bootloader_reentry */
                                    0x10u |                                      /* travel_window */
-                                   0x20u);                                      /* linear_2x2 */
+                                   0x20u |                                      /* linear_2x2 */
+                                   (engine->sensor_dpi != 0u ? 0x40u : 0u));    /* sensor_dpi known: ONLY_AT_BASE_DPI works */
             write_u16_le(&payload[8], 50u);
             write_u16_le(&payload[10], DDPI_DPI_MAX);
             write_u16_le(&payload[12], DDPI_Q8_8_MIN);
             write_u16_le(&payload[14], DDPI_Q8_8_MAX);
             payload[16] = DDPI_DEFAULT_WINDOW_COUNTS;
             payload[17] = DDPI_MAX_WINDOW_COUNTS;
+            write_u16_le(&payload[18], engine->sensor_dpi); /* current sensor DPI, 0 = unknown */
             break;
         }
 
@@ -726,8 +746,10 @@ bool ddpi_hid_handle_feature_report(
         }
 
         case DDPI_CMD_RESET_DEFAULTS: {
-            /* Keep the device's own base CPI; only the curve returns to neutral */
+            /* Keep the device's own base CPI and the reported sensor DPI; only the curve returns to neutral */
+            uint16_t sensor_dpi = engine->sensor_dpi;
             ddpi_engine_init(engine, engine->profile.base_dpi);
+            engine->sensor_dpi = sensor_dpi;
             ddpi_profile_serialize(&engine->profile, payload);
             break;
         }

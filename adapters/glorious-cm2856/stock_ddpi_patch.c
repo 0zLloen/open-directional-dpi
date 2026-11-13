@@ -38,6 +38,10 @@ void *memset(void *dst, int c, size_t n) {
 #define STOCK_SENSOR_STATE_MOTION    (*(volatile uint8_t  *)0x20003020u)
 #define STOCK_SENSOR_STATE_DX        (*(volatile int16_t  *)0x2000302Eu)
 #define STOCK_SENSOR_STATE_DY        (*(volatile int16_t  *)0x20003030u)
+/* Active DPI (X) in DPI units, kept by every stock DPI path (button, host HID over USB and
+ * 2.4 GHz, boot, profile switch) before it programs the sensor at 0x17860. A held DPI-shift
+ * key programs the sensor without updating it. */
+#define STOCK_ACTIVE_DPI_X           (*(volatile uint16_t *)0x20003068u)
 
 #define STOCK_USB_FEAT_FLAG          (*(volatile uint8_t  *)0x200032D4u)
 #define STOCK_USB_GETFEAT_PTR        (*(uint8_t * volatile *)0x200032D8u)
@@ -154,6 +158,7 @@ void ddpi_usb_protocol_wrapper(void) {
     if (feat[1] == 0x50u && feat[5] == DDPI_HID_NAMESPACE) {
         ddpi_ensure_initialized();
         ddpi_sram_state_t *st = get_ddpi_state();
+        ddpi_engine_set_sensor_dpi(&st->engine, STOCK_ACTIVE_DPI_X);
 
         uint8_t req_copy[DDPI_HID_PACKET_LEN];
         memcpy(req_copy, feat, DDPI_HID_PACKET_LEN);
@@ -210,6 +215,7 @@ void ddpi_paw3370_burst_wrapper(void) {
         /* No idle reset (ddpi_process_motion): no verified stock millisecond tick to
          * read yet. A profile with travel window L > 0 lets a new flick's first ~L
          * counts lean toward the previous direction; L = 0 has no such carry-over. */
+        ddpi_engine_set_sensor_dpi(&st->engine, STOCK_ACTIVE_DPI_X); /* single-DPI-stage profiles */
         ddpi_process_delta(&st->engine, raw_dx, raw_dy, &out_dx, &out_dy);
 
         STOCK_SENSOR_STATE_DX = out_dx;

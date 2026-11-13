@@ -107,7 +107,7 @@ Used only by the angular-gain model (§6.2). The window length $L$ is the low by
 ## 6. Per-Report Processing (`ddpi_process_delta`)
 
 ### 6.1 Identity bypass
-The profile is an identity when flag bit 0 (`ENABLED`) is clear, or flag bit 6 (`BYPASS_FOR_CALIBRATION`) is set, or the global gain and all 8 multipliers are `0x0100`. Then `out = in` (with `-32768` clamped to `-32767`), and the estimator and remainders are left untouched. Loading an identity profile (`ddpi_engine_set_profile`) clears the remainders and $\mathbf{d}$.
+The profile is an identity when flag bit 0 (`ENABLED`) is clear, or flag bit 6 (`BYPASS_FOR_CALIBRATION`) is set, or the global gain and all 8 multipliers are `0x0100`. The curve is also off when flag bit 7 (`ONLY_AT_BASE_DPI`) is set and the adapter reports a sensor DPI other than `base_dpi`. Then `out = in` (with `-32768` clamped to `-32767`), and the estimator and remainders are left untouched. A change of the reported sensor DPI clears the remainders and $\mathbf{d}$. Loading an identity profile (`ddpi_engine_set_profile`) clears the remainders and $\mathbf{d}$.
 
 A report of $(0, 0)$ outputs $(0, 0)$ and changes no state.
 
@@ -164,7 +164,7 @@ typedef struct __attribute__((packed)) {
 | 4 | `DDPI_FLAG_MODEL_LINEAR_2X2` | `model: "linear-2x2"` | Stateless 2×2 model from E/N/NE/NW (§6.3). |
 | 5 | `DDPI_FLAG_RESET_REMAINDER_ON_REVERSE` | `resetRemainderOnReverse` | Clear an axis remainder when the raw delta opposes it (§6.4). |
 | 6 | `DDPI_FLAG_BYPASS_FOR_CALIBRATION` | — | Transient 1.00x bypass while calibrating (HID `SET_ENABLED` mode 2). Never exported to JSON; hosts should not save a profile with it set. |
-| 7 | — | — | Reserved, write 0. |
+| 7 | `DDPI_FLAG_ONLY_AT_BASE_DPI` | `onlyAtBaseDpi` | Single DPI stage (like Corsair PureVector): the curve applies only while the sensor runs at `base_dpi`; at any other DPI the output equals the input (§6.1). Needs an adapter that reports the sensor DPI (`ddpi_engine_set_sensor_dpi`, HID capabilities bytes `18..19`); while it is unknown (`0`) the flag has no effect. |
 
 `ddpi_profile_set_ccw_frame()` converts a profile between the two orders in place (swapping index $i \leftrightarrow 8 - i$ for $i = 1..3$) and toggles bit 3.
 

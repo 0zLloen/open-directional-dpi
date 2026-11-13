@@ -32,6 +32,8 @@ export const DDPI_FLAG_FRAME_SENSOR_CCW = 1 << 3;
 export const DDPI_FLAG_MODEL_LINEAR_2X2 = 1 << 4;
 export const DDPI_FLAG_RESET_REMAINDER_ON_REVERSE = 1 << 5;
 export const DDPI_FLAG_BYPASS_FOR_CALIBRATION = 1 << 6;
+/** Single DPI stage (like Corsair PureVector): the curve applies only while the sensor runs at baseDpi */
+export const DDPI_FLAG_ONLY_AT_BASE_DPI = 1 << 7;
 export const DDPI_DEFAULT_WINDOW_COUNTS = 16;
 export const DDPI_MAX_WINDOW_COUNTS = 128;
 export const DDPI_DPI_MIN = 50;
@@ -103,7 +105,7 @@ export interface DdpiProfileV1 {
  * Shareable profile JSON. `directionalMultipliers` always names physical HID
  * directions (E = right, S = toward the user, N = away) whatever `frame` the
  * firmware profile stores its array in. Fields added after the first release
- * (frame .. idleResetMs) are optional on import and default to the old behaviour.
+ * (frame .. onlyAtBaseDpi) are optional on import and default to the old behaviour.
  */
 export interface DdpiProfileJsonExport {
   schema: "open-directional-dpi-v1";
@@ -119,6 +121,8 @@ export interface DdpiProfileJsonExport {
   windowCounts: number;
   /** Idle gap that resets the direction estimator, multiple of 5; 0 = firmware default (50 ms) */
   idleResetMs: number;
+  /** Apply only while the sensor runs at baseDpi (one DPI stage, like Corsair PureVector) */
+  onlyAtBaseDpi: boolean;
   baseDpi: number;
   globalGain: number;
   directionalMultipliers: {
@@ -147,6 +151,8 @@ export interface DdpiDeviceCapabilities {
   maxDpi: number;
   minMultiplierQ8_8: number;
   maxMultiplierQ8_8: number;
+  /** Current sensor DPI as reported by the firmware (0 = unknown; then onlyAtBaseDpi has no effect) */
+  sensorDpi: number;
 }
 
 export interface WebHidFeatureTransport {
@@ -466,6 +472,7 @@ export function exportProfileJson(profile: DdpiProfileV1): string {
     model: has(DDPI_FLAG_MODEL_LINEAR_2X2) ? "linear-2x2" : "angular-gain",
     windowCounts: Math.min(DDPI_MAX_WINDOW_COUNTS, profile.reserved & 0xff),
     idleResetMs: ((profile.reserved >> 8) & 0xff) * 5,
+    onlyAtBaseDpi: has(DDPI_FLAG_ONLY_AT_BASE_DPI),
     baseDpi: profile.baseDpi,
     globalGain: q8_8ToFloat(profile.globalGainQ8_8),
     directionalMultipliers,
@@ -528,7 +535,8 @@ export function importProfileJson(jsonStr: string): DdpiProfileV1 {
     (bool("linearOctantRatio") ? DDPI_FLAG_LINEAR_OCTANT_RATIO : 0) |
     (bool("resetRemainderOnReverse") ? DDPI_FLAG_RESET_REMAINDER_ON_REVERSE : 0) |
     (oneOf("frame", JSON_FRAMES) === "odd-sensor-ccw" ? DDPI_FLAG_FRAME_SENSOR_CCW : 0) |
-    (oneOf("model", JSON_MODELS) === "linear-2x2" ? DDPI_FLAG_MODEL_LINEAR_2X2 : 0);
+    (oneOf("model", JSON_MODELS) === "linear-2x2" ? DDPI_FLAG_MODEL_LINEAR_2X2 : 0) |
+    (bool("onlyAtBaseDpi") ? DDPI_FLAG_ONLY_AT_BASE_DPI : 0);
 
   const windowCounts = int("windowCounts", 0, DDPI_MAX_WINDOW_COUNTS, 0);
   const idleResetMs = int("idleResetMs", 0, 255 * 5, 0);
@@ -652,6 +660,7 @@ export class OpenMouseDirectionalDpiClient {
         maxDpi: glorious ? 19000 : 0,
         minMultiplierQ8_8: DDPI_Q8_8_ONE,
         maxMultiplierQ8_8: DDPI_Q8_8_ONE,
+        sensorDpi: 0,
       };
     }
 
@@ -684,6 +693,7 @@ export class OpenMouseDirectionalDpiClient {
       maxDpi: dv.getUint16(18, true),
       minMultiplierQ8_8: dv.getUint16(20, true),
       maxMultiplierQ8_8: dv.getUint16(22, true),
+      sensorDpi: dv.getUint16(26, true),
     };
   }
 
