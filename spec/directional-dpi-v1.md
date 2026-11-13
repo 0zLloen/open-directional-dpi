@@ -100,7 +100,7 @@ Used only by the angular-gain model (§6.2). The window length $L$ is the low by
 
   Because each report adds its full $256 \cdot \Delta$ and the decay depends on distance, one 1 kHz report of $(2, -2)$ and the matching 8 kHz reports $(1, 0), (0, -1)$ end up with nearly the same direction.
 
-**Idle reset.** `ddpi_process_motion(engine, dx, dy, now_ms, ...)` runs `ddpi_process_delta` after this check: for a non-zero report, if `now_ms - last_motion_ms >= idle_ms` (unsigned, so a wrapping millisecond clock works) then $\mathbf{d} \leftarrow (0, 0)$; then `last_motion_ms = now_ms`. Zero reports do not update `last_motion_ms`. `idle_ms` is the high byte of `reserved` times 5 ms, or 50 ms (`DDPI_DEFAULT_IDLE_MS`) when that byte is 0. Remainders are not touched. `ddpi_process_delta` alone never resets $\mathbf{d}$ (the Glorious patch and `SIMULATE_DELTA` use it), so with $L > 0$ the first $\sim L$ counts of a new flick lean toward the previous direction there.
+**Idle reset.** `ddpi_process_motion(engine, dx, dy, now_ms, ...)` runs `ddpi_process_delta` after this check: for a non-zero report, if `now_ms - last_motion_ms >= idle_ms` (unsigned, so a wrapping millisecond clock works) then $\mathbf{d} \leftarrow (0, 0)$; then `last_motion_ms = now_ms`. Zero reports do not update `last_motion_ms`. `idle_ms` is the high byte of `reserved` times 5 ms, or 50 ms (`DDPI_DEFAULT_IDLE_MS`) when that byte is 0. Remainders are not touched. `ddpi_process_delta` alone never resets $\mathbf{d}$ (`SIMULATE_DELTA` uses it), so with $L > 0$ the first $\sim L$ counts of a simulated flick lean toward the previous direction.
 
 ---
 
@@ -181,7 +181,7 @@ The neutral default profile: flags `0` (disabled), `base_dpi` as given (`0` -> 8
 
 ## 8. JSON Profile File (`open-directional-dpi-v1`)
 
-Written by OpenMouse `exportProfileJson` and the calibration page, read by `importProfileJson` (`integrations/openmouse/src/directional-dpi.ts`).
+Written by `exportProfileJson` (`integrations/openmouse/src/directional-dpi.ts`), `calibrate.html`, `calibration/cli.ts` and `tools/odd_profile.py export`; read by `importProfileJson` (also used by `calibration/cli.ts format`) and `tools/odd_profile.py load` / `encode`. OpenMouse test 19 checks that the Python and TypeScript mappings agree byte for byte.
 
 | Field | Type / range | Profile field | Default when missing |
 | :--- | :--- | :--- | :--- |
