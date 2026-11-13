@@ -36,7 +36,7 @@ import {
   serializeProfileV1,
   type WebHidFeatureTransport,
 } from "../src/directional-dpi.ts";
-import { MockGloriousReceiverHidDevice, MockGloriousSeriesOneProHidDevice } from "../src/mock-hid.ts";
+import { MockGloriousReceiverHidDevice, MockGloriousSeriesOneProHidDevice, MockQmkRawHidDevice } from "../src/mock-hid.ts";
 
 async function runTests(): Promise<void> {
   console.log("=== OpenMouse — Open Directional DPI v1 Integration Tests ===");
@@ -549,7 +549,53 @@ async function runTests(): Promise<void> {
     console.log("  [PASS] 20. 2.4 GHz receiver: relayed detection and envelope, transient 0xA4, cable preferred");
   }
 
-  console.log("\nAll 20/20 OpenMouse integration test suites passed.");
+  {
+    /* 21. QMK raw HID (spec/hid-protocol-v1.md §6): the GET_CAPABILITIES probe identifies the
+     * adapter; VIA / Vial boards without it and raw HID without a handler are left alone */
+    const kb = new MockQmkRawHidDevice("ddpi");
+    kb.viaAppOpen = true; // the VIA app's reports on the same interface are skipped
+    const client = new OpenMouseDirectionalDpiClient(kb);
+    const caps = await client.detectCapabilities();
+    assert.deepEqual([caps.firmwareKind, caps.bootloaderReentry, kb.framesReceived], ["open-directional-dpi-v1", false, 6]);
+    const p = createDefaultProfileV1(800);
+    p.flags = DDPI_FLAG_ENABLED;
+    p.multipliersQ8_8[DdpiDirection.S] = 192;
+    assert.equal((await client.setProfile(p)).multipliersQ8_8[DdpiDirection.S], 192);
+    assert.equal((await client.getProfile()).multipliersQ8_8[DdpiDirection.S], 192);
+    assert.equal((await client.simulateDelta(0, 100)).outDy, 75);
+    await assert.rejects(client.enterBootloader(), /status 0xa3/);
+    assert.equal(kb.engine.oddPacketsReceived, 5);
+
+    /* Probe only: VIA answers 0xFF to the first frame, a handler-less board never answers,
+     * and a Vial board mid-unlock echoes every frame (the reads come back as zeros) */
+    const others = (["via", "silent", "vial-unlocking"] as const).map((s) => new MockQmkRawHidDevice(s));
+    const kinds = await Promise.all(others.map(async (d) => (await new OpenMouseDirectionalDpiClient(d).detectCapabilities()).firmwareKind));
+    assert.deepEqual(kinds, ["unsupported", "unsupported", "unsupported"]);
+    assert.deepEqual([others[0]!.framesReceived, others[1]!.framesReceived], [1, 1]);
+    assert.equal(others[2]!.engine.oddPacketsReceived, 0);
+
+    /* §6.3 rule 3: a valid answer (CRC, status 0xA1) without "DP01" is a foreign 0xDF handler */
+    const foreign = new MockQmkRawHidDevice("ddpi");
+    foreign.engine.capsMagic = "XX01";
+    assert.equal((await new OpenMouseDirectionalDpiClient(foreign).detectCapabilities()).firmwareKind, "unsupported");
+    assert.equal(foreign.framesReceived, 6);
+
+    /* A WebHID error is not "unsupported": it reaches the caller */
+    const closed = new MockQmkRawHidDevice("ddpi");
+    closed.sendReport = async () => {
+      throw new DOMException("The device must be opened first.", "InvalidStateError");
+    };
+    await assert.rejects(new OpenMouseDirectionalDpiClient(closed).detectCapabilities(), { name: "InvalidStateError" });
+
+    /* Only the 0xFF60 / 0x61 interface is probed */
+    const keys = new MockQmkRawHidDevice("ddpi");
+    keys.collections = [{ usagePage: 0x01, usage: 0x06 }];
+    assert.equal((await new OpenMouseDirectionalDpiClient(keys).detectCapabilities()).firmwareKind, "unsupported");
+    assert.equal(keys.framesReceived, 0);
+    console.log("  [PASS] 21. QMK raw HID: probe identifies the adapter, VIA / Vial / no-handler boards stay unsupported");
+  }
+
+  console.log("\nAll 21/21 OpenMouse integration test suites passed.");
 }
 
 runTests().catch((err) => {

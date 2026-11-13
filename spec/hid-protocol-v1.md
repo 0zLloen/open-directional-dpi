@@ -14,7 +14,8 @@ The device supplies two optional callbacks: `on_save_flash` (persist the profile
 Where each route gets it:
 - **Glorious Series One Pro** (stock-firmware patch): the stock firmware already has this report on USB interface 2 of `258a:2018` (wired) and `258a:2031` (receiver); the patch adds the protocol to it.
 - **Zephyr / ZMK / ZGM**: the firmware's own HID handler calls `odd_input_hid_feature_report()` and its USB product string carries `[OpenDDPIv1]` (see `adapters/zephyr/README.md`). ZMK has no vendor feature report by default, so there the profile comes from devicetree.
-- **QMK** and the **Linux evdev filter** do not implement this protocol; their profile is set in `keymap.c` or on the command line.
+- **QMK**: no Feature report. The same 64-byte packets travel over QMK's raw HID interface in 32-byte frames (§6). Without `RAW_ENABLE` the profile is set in `keymap.c`.
+- The **Linux evdev filter** does not implement this protocol; its profile is set on the command line.
 
 ---
 
@@ -32,7 +33,7 @@ Payload indices (`feat[i] = buf[i+1]`, `buf[0]` = Report ID `0x00`), verified on
 
 ### 2.2 Safe detection for hosts
 A host must not send Open Directional DPI packets to a device that has not identified itself. The hosts here (`detectCapabilities()` in `integrations/openmouse/src/directional-dpi.ts`, `calibrate.html`, `tools/odd_profile.py`) do this:
-1. **Any device:** a USB product string containing `[OpenDDPIv1]` (e.g. `"My Mouse [OpenDDPIv1]"`). Zephyr / ZMK / ZGM firmware sets it in its USB configuration (`adapters/zephyr/README.md`). Any other device without it is `"unsupported"` and gets no packet.
+1. **Any device:** a USB product string containing `[OpenDDPIv1]` (e.g. `"My Mouse [OpenDDPIv1]"`). Zephyr / ZMK / ZGM firmware sets it in its USB configuration (`adapters/zephyr/README.md`). Any other device without it is `"unsupported"` and gets no packet. A QMK raw HID interface is identified by the probe of §6.3 instead.
 2. **Glorious Series One Pro IDs only** (`258a:2018`, `258a:2031`): the host sends the stock firmware-version query (§2.1); through the receiver `258a:2031` it sends the relayed query of §2.3 instead. `bcdDevice` is not a marker: the patch keeps the stock descriptors (`0x0101` cable, `0x0100` receiver). The patch answers the query unchanged and also writes `"DP01"` (`0x44, 0x50, 0x30, 0x31`) into payload bytes `16..19` and, since the 2.4 GHz relay build (`505404c`), `12..15`. No stamp: `"stock-glorious"`. Verified on a retail mouse (2026-11-13): stock v1.0.0.0 answers `a1 00 00 03 00 81 01 00 00 00 20 18` with bytes `16..19` zero; with the patch flashed the same reply carries `DP01` there, and `GET_CAPABILITIES` / `GET_PROFILE` answer with valid CRCs.
 3. **`GET_CAPABILITIES`** (§4.1) then confirms with the `"DP01"` magic.
 
@@ -106,4 +107,70 @@ Unless stated otherwise, commands act on the live engine in RAM, and an unknown 
 ## 5. Per-Route Behaviour
 
 - **Glorious stock patch**: flags `0xFA` (save, bootloader, travel window, 2×2, sensor DPI, clock). `SAVE_FLASH` writes the profile to flash page `0x0007E000`, which is loaded at boot (otherwise the neutral 800-CPI default). An unchanged profile is not written again (no erase; added after the `505404c` build). Through the receiver a save that erases answers late: about 770 ms in an earlier test (§2.3). Verified on `21ea252` through the receiver (2026-11-13): a changed profile answered after 402 ms, an identical second save after 24 ms (no erase, no `0xA4`), and the saved profile survived switching the mouse off and on. `ENTER_BOOTLOADER` writes `0xA55AA55A` to `0x2003FFFC` and resets into the Compx bootloader (`258a:2103`); holding LMB + RMB + DPI (P1.15, P1.13, P1.00, low when pressed) at power-up does the same (emulated by `build_and_verify_patch.py` test 1). Both verified on the cable (2026-11-13, `21ea252`): `ENTER_BOOTLOADER` gave `258a:2103` after 1.0 s, and without the magic the patch answers `0xA4` and stays in the application. It resets the direction estimator after the profile's idle gap (default 50 ms). The clock is the count of stock sensor-read calls, one per 1 ms TIMER1 tick while the mouse is still (from the stock disassembly; the reset is checked in Unicorn); capabilities bytes `20..23` report it, so its rate can be checked against wall time. Verified on the cable (2026-11-13, `21ea252`): 1000.0 ticks/s with the mouse still, read once a second for 12 s. Over 2.4 GHz the rate cannot be read (while the mouse sends no reports the receiver answers `0xA4`, so requests do not reach it); inferred to be the same TIMER1 tick. `505404c` has no idle reset. It reports the active DPI (`sensor_dpi`, capabilities bytes `18..19`) from the stock firmware's own variable at `0x20003068`, so `ONLY_AT_BASE_DPI` profiles follow the DPI button; verified on a retail mouse cycling 400/800/1600/3200 (2026-11-13). A held DPI-shift key changes the sensor without updating that variable.
+- **QMK raw HID** (§6): flags `0xF0` (travel window, 2×2, sensor DPI from `pointing_device_get_cpi()`, clock from `timer_read32()`, both as the pointing device task last saw them), plus `0x02` with `EECONFIG_USER_DATA_SIZE >= 28`. `SAVE_FLASH` writes the user datablock (EEPROM) at once. `ENTER_BOOTLOADER` answers `0xA3`. Not yet run on a device.
 - **Zephyr filter**: flags `0x30`, plus `0x02` with `CONFIG_SETTINGS`. `SAVE_FLASH` answers OK at once and writes the profile to settings key `odd/<devicetree node name>` `CONFIG_ODD_DIRECTIONAL_DPI_SAVE_DELAY_MS` (default 500 ms) later. `ENTER_BOOTLOADER` answers `0xA3` unless the board intercepts opcode `0x0F` before calling the filter.
+
+---
+
+## 6. QMK Raw HID Transport
+
+QMK has no vendor Feature report, but most QMK boards already have raw HID for VIA or Vial. This transport carries the unchanged 64-byte packet (§3) over it in 32-byte frames, so `ddpi_hid_handle_feature_report()` runs on the reassembled packet byte for byte. Inferred from the QMK 0.34.8 (`ec8a1b6`) and vial-qmk (`vial` branch, `dd43959`) sources (2026-11-13); not yet built in QMK or run on a device.
+
+### 6.1 Interface
+- QMK's raw HID interface: Usage Page `0xFF60`, Usage `0x61` (QMK's default `RAW_USAGE_PAGE` / `RAW_USAGE_ID`; a board that changes them is not found). Its report descriptor starts `06 60 ff 09 61 a1 01`. One unnumbered 32-byte Input report and one 32-byte Output report (fixed at 32 bytes; V-USB sends them over an 8-byte endpoint).
+- Host side: write 33 bytes `[0x00, f0..f31]` (`hidraw` `write()`, HIDAPI `hid_write()`) or `sendReport(0x00, Uint8Array(32))` in WebHID. Replies are 32-byte Input reports (`hidraw` `read()`, `hid_read()`, WebHID `inputreport`).
+- QMK passes each Output report to `raw_hid_receive(data, 32)` from its main loop (`quantum/main.c`), the loop that also runs the pointing device task, so the engine needs no lock.
+- VIA and Vial read replies from the same interface. Close them while configuring.
+
+### 6.2 Framing
+
+| Frame offset | Field | Value |
+| :---: | :--- | :--- |
+| `0` | `marker` | `0xDF` (the namespace byte, §3) |
+| `1` | `chunk` | `0x00`, `0x01`, `0x02`: write chunk `i` of the request. `0x80`, `0x81`, `0x82`: read chunk `i` of the response |
+| `2..31` | `data` | Chunk `i` holds packet bytes `30*i .. 30*i+29`. Chunk 2 holds bytes `60..63` in frame bytes `2..5`; frame bytes `6..31` are `0` |
+
+- One command is six frames in lock step (send a frame, take its reply, then send the next): write chunks `0x00, 0x01, 0x02`, then read chunks `0x80, 0x81, 0x82`. Read frames carry zero data. Lock step keeps at most one reply queued: QMK queues 4 raw HID reports on ChibiOS, and LUFA drops a report the host has not collected within about 10 ms.
+- The device answers every frame whose byte 0 is `0xDF` with exactly one frame: the received frame, changed in place. A write frame comes back unchanged. A read frame comes back with chunk `i` of the device's last response in `data` (zeros before the first response). One reply per frame, built in place, is what Vial needs: its `via.c` sends the received buffer back after the hook, and that hook must not call `raw_hid_send()`.
+- Reassembly: write chunk `0x00` starts a new request and drops any partial one. Chunk `0x01` is taken only right after `0x00`, and `0x02` only right after `0x01`. Any other order or `chunk` value drops the partial request (the frame is still answered). Chunk `0x02` completes the packet: the device runs `ddpi_hid_handle_feature_report()` on the 64 bytes and keeps the response for the read frames. There is no timer: a host that gives up mid-request starts again with chunk `0x00`.
+- The reply to a frame is the next Input report with the same byte 1 and byte 0 `0xDF`, or `0xFF` (§6.3). Other Input reports belong to another program and are skipped.
+- The reassembled read is the answer of §3: hosts check `'D','P'`, the CRC, `seq`, `opcode` and a status `0xA1..0xA4`. As with GET_REPORT, a host may read again until the 2 s deadline, but QMK answers before it replies to write chunk `0x02`, so the first read has the answer.
+
+### 6.3 Identification
+A raw HID interface carries no `[OpenDDPIv1]` product string and no `DP01` stamp, so hosts identify it with one probe:
+1. Only an interface with Usage Page `0xFF60`, Usage `0x61` is probed.
+2. The probe is `GET_CAPABILITIES` (`seq` 5..255) in the framing of §6.2. The host stops at the first reply whose byte 0 is not `0xDF`, or at the 2 s deadline: `"unsupported"`.
+3. The device is identified only if the reassembled answer is a valid response to the probe (§3) with status `0xA1` and `"DP01"` at payload `0..3` (§4.1). Anything else, including frames echoed unchanged, is `"unsupported"`, and the device gets no other packet.
+
+Why the probe is harmless (from the sources above):
+- Raw HID without a handler: the weak `raw_hid_receive()` (`quantum/raw_hid.c`) ignores the frame. Nothing answers.
+- VIA (QMK `quantum/via.c`): `raw_hid_receive()` calls `via_command_kb()` (weak, returns `false`) and then switches on byte 0. VIA command ids are `0x01..0x15`. Byte `0xDF` takes the `default` branch, which only sets byte 0 to `0xFF` (`id_unhandled`) and sends the frame back. A VIA board therefore sees one frame (`df 00 44 50 01 00 <seq> df 01 00`, then zeros), answers `0xFF`, and the host stops: no EEPROM write, keymap change or bootloader jump.
+- Vial (vial-qmk `quantum/via.c`): ids `0x01..0x13` and the prefix `0xFE`. Byte `0xDF` takes `default`, whose weak `raw_hid_receive_kb()` sets `0xFF`, and the frame goes back as with VIA. While a Vial unlock is in progress every non-Vial frame is echoed unchanged with no handler run; the reads then reassemble to zeros, so the probe fails without effect.
+- On a device with this transport, `GET_CAPABILITIES` only reads.
+- Inferred, not checked: a board with its own raw HID handler could use `0xDF` as a command. None is known. Such a board receives only write chunk 0 unless it echoes `0xDF` back.
+
+### 6.4 QMK device side
+The adapter (`adapters/qmk`) provides `bool odd_qmk_raw_hid(uint8_t *data, uint8_t length)` under `#if defined(RAW_ENABLE)` (QMK defines it for `RAW_ENABLE = yes` and for `VIA_ENABLE = yes`). It returns `false` and leaves `data` alone unless `length` is 32 and byte 0 is `0xDF`; otherwise it handles the frame (§6.2), leaves the reply in `data` and returns `true`. It calls no QMK function. `adapters/qmk/odd_raw_hid.c` calls it from the hook the build's raw HID stack has:
+
+```c
+#include "raw_hid.h"
+#if defined(VIAL_ENABLE) /* vial-qmk: no via_command_kb(); via.c sends data after this hook */
+void raw_hid_receive_kb(uint8_t *data, uint8_t length) {
+    if (!odd_qmk_raw_hid(data, length)) data[0] = 0xFF; /* id_unhandled, as the weak default */
+}
+#elif defined(VIA_ENABLE) /* QMK VIA: true means handled and sent */
+bool via_command_kb(uint8_t *data, uint8_t length) {
+    if (!odd_qmk_raw_hid(data, length)) return false;
+    raw_hid_send(data, length);
+    return true;
+}
+#else /* RAW_ENABLE only */
+void raw_hid_receive(uint8_t *data, uint8_t length) {
+    if (odd_qmk_raw_hid(data, length)) raw_hid_send(data, length);
+}
+#endif
+```
+
+- Vial is tested first because Vial builds also set `VIA_ENABLE`; vial-qmk has no `via_command_kb()` and QMK has no `raw_hid_receive_kb()`.
+- A keyboard that already defines one of these hooks leaves `odd_raw_hid.c` out and calls `odd_qmk_raw_hid()` first from its own hook.
+- `on_enter_bootloader` is `NULL` (`ENTER_BOOTLOADER` answers `0xA3`): QMK's VIA has no bootloader command and Vial allows one only after an unlock, so this transport must not add one. `on_save_flash` stores the 28-byte profile in bytes `0..27` of QMK's user datablock (`eeconfig_update_user_datablock()`) when `config.h` sets `EECONFIG_USER_DATA_SIZE >= 28`, and `odd_qmk_init()` loads it at boot; otherwise it is `NULL`.

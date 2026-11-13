@@ -13,9 +13,9 @@ Thank you for contributing to an open, vendor-neutral standard and portable refe
    - `core/directional_dpi.c` and `core/directional_dpi.h` must remain zero-dependency C11 with no floating-point operations, so firmware and host builds produce the same output.
    - If a change alters engine output, regenerate the conformance vectors (`make -C tests vectors`), commit `tests/vectors/`, and keep the TypeScript mirror (`integrations/openmouse/src/directional-dpi.ts`) bit-exact with them.
 3. **Verification Before Submitting:**
-   - `make -C tests test` (17/17 C unit tests).
+   - `make -C tests test` (17/17 C unit tests, then the QMK raw HID transport in `tests/test_qmk_raw_hid.c`).
    - `make -C tests vectors && git diff --exit-code -- tests/vectors` (vectors still match the engine).
-   - `node --experimental-strip-types --test integrations/openmouse/test/directional-dpi.test.ts` (20/20 OpenMouse suites, including parity with the 2592 C vectors and with `tools/odd_profile.py`, and the 2.4 GHz receiver; about 7.5 s; Node >= 22.6, `python3` on PATH).
+   - `node --experimental-strip-types --test integrations/openmouse/test/directional-dpi.test.ts` (21/21 OpenMouse suites, including parity with the 2592 C vectors and with `tools/odd_profile.py`, the 2.4 GHz receiver and QMK raw HID; about 9.5 s; Node >= 22.6, `python3` on PATH).
    - `node --experimental-strip-types --test calibration/tests/*.test.ts` (calibration pipeline, trainer providers, CLI formats and the `calibrate.html` WebHID client; the QMK format test needs `cc`).
    - `npm ci && npx tsc -p tsconfig.json` (strict type-check of `integrations/openmouse` and `calibration`; `noUnusedLocals` and `noUnusedParameters` are on).
    - `python3 tools/test_odd_profile.py` (`odd_profile.py` device layer against a fake cable and receiver).

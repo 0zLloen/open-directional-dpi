@@ -49,13 +49,15 @@ jobs:
           make -C adapters/linux-evdev clean
           make -C adapters/linux-evdev check
 
-      - name: Compile QMK pointing-device adapter (8-bit and extended reports)
+      # The raw HID transport (RAW_ENABLE) also runs in `make -C tests test` (test_qmk_raw_hid)
+      - name: Compile QMK pointing-device adapter (8-bit and extended reports, raw HID)
         run: |
           gcc -std=c11 -Wall -Wextra -Werror -pedantic -c adapters/qmk/odd_pointing_device.c -o /dev/null
           gcc -std=c11 -Wall -Wextra -Werror -pedantic -DMOUSE_EXTENDED_REPORT -c adapters/qmk/odd_pointing_device.c -o /dev/null
+          gcc -std=c11 -Wall -Wextra -Werror -pedantic -DRAW_ENABLE -c adapters/qmk/odd_pointing_device.c -o /dev/null
 
       # The step above uses the adapter's stand-in types. This one uses QMK's own report.h,
-      # pointing_device.h and timer.h (headers only, no keyboard build); -include makes the
+      # pointing_device.h, timer.h, eeconfig.h and raw_hid.h (headers only, no keyboard build); -include makes the
       # stand-ins clash with them if the QMK_KEYBOARD_H branch is ever skipped. Bump tag and SHA together.
       - name: Compile QMK adapter against QMK 0.34.8 headers
         env:
@@ -67,11 +69,16 @@ jobs:
           git -C "$Q" sparse-checkout set tmk_core/protocol quantum platforms
           git -C "$Q" fetch -q --depth 1 --filter=blob:none origin "$QMK_SHA"
           git -C "$Q" checkout -q FETCH_HEAD
-          for ext in "" -DMOUSE_EXTENDED_REPORT; do
-            gcc -std=gnu11 -Wall -Wextra -Werror -pedantic $ext \
-              -isystem "$Q/tmk_core/protocol" -isystem "$Q/quantum" -isystem "$Q/quantum/pointing_device" -isystem "$Q/platforms" \
+          I="-isystem $Q/tmk_core/protocol -isystem $Q/quantum -isystem $Q/quantum/pointing_device -isystem $Q/platforms"
+          # Raw HID without and with the SAVE_FLASH datablock (EECONFIG_USER_DATA_SIZE in config.h)
+          for ext in "" -DMOUSE_EXTENDED_REPORT -DRAW_ENABLE "-DRAW_ENABLE -DEECONFIG_USER_DATA_SIZE=28 -include eeconfig.h"; do
+            gcc -std=gnu11 -Wall -Wextra -Werror -pedantic $ext $I \
               -include timer.h -include pointing_device.h -DQMK_KEYBOARD_H='"pointing_device.h"' \
               -c adapters/qmk/odd_pointing_device.c -o /dev/null
+          done
+          # Raw HID hook for RAW_ENABLE alone, QMK VIA (VIA_ENABLE = yes sets RAW_ENABLE) and Vial (sets both)
+          for hook in "" -DVIA_ENABLE "-DVIA_ENABLE -DVIAL_ENABLE"; do
+            gcc -std=gnu11 -Wall -Wextra -Werror -pedantic -DRAW_ENABLE $hook $I -c adapters/qmk/odd_raw_hid.c -o /dev/null
           done
 
       # Fails if the patch outgrows PATCH_ROM, needs .bss/.data, pulls in a libgcc
