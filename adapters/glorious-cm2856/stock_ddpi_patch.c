@@ -162,7 +162,14 @@ void ddpi_usb_protocol_wrapper(void) {
 
         uint8_t req_copy[DDPI_HID_PACKET_LEN];
         memcpy(req_copy, feat, DDPI_HID_PACKET_LEN);
-        req_copy[0] = 0x44u; /* Restore 'D' in case USBD ISR set feat[0] = 0xA0 */
+        req_copy[0] = 0x44u; /* Restore 'D': the USB ISR and the 2.4 GHz receiver set feat[0] = 0xA0 */
+        if (req_copy[2] == 0x02u) {
+            /* Relayed through the 258a:2031 receiver: it only forwards packets with feat[2] = 0x02
+             * (target: mouse) and forwards feat[3] + 6 bytes, so hosts send feat[3] = 0x3A. Both are
+             * transport bytes; the CRC covers the canonical packet (feat[2] = 1, feat[3] = 0). */
+            req_copy[2] = DDPI_PROFILE_VERSION;
+            req_copy[3] = 0u;
+        }
         ddpi_hid_handle_feature_report(
             &st->engine,
             req_copy,
@@ -180,18 +187,16 @@ void ddpi_usb_protocol_wrapper(void) {
     /* Execute 100% unmodified stock USB protocol handler */
     STOCK_FN_USB_PROTOCOL();
 
-    /* Stamp "DP01" into unused bytes [16..19] of the FW version response */
+    /* Stamp "DP01" into unused bytes of the FW version response: [16..19] (cable) and [12..15],
+     * because over 2.4 GHz only the first 16 bytes of that reply travel (feat[3] = 3 -> 9 -> 2 chunks) */
     if (is_ver_query && feat[0] == 0xA1u) {
-        feat[16] = 0x44u; /* 'D' */
-        feat[17] = 0x50u; /* 'P' */
-        feat[18] = 0x30u; /* '0' */
-        feat[19] = 0x31u; /* '1' */
+        static const uint8_t stamp[4] = {0x44u, 0x50u, 0x30u, 0x31u}; /* "DP01" */
         uint8_t *usb_get_buf = STOCK_USB_GETFEAT_PTR;
+        memcpy(&feat[12], stamp, 4);
+        memcpy(&feat[16], stamp, 4);
         if (usb_get_buf != NULL) {
-            usb_get_buf[16] = 0x44u;
-            usb_get_buf[17] = 0x50u;
-            usb_get_buf[18] = 0x30u;
-            usb_get_buf[19] = 0x31u;
+            memcpy(&usb_get_buf[12], stamp, 4);
+            memcpy(&usb_get_buf[16], stamp, 4);
         }
     }
 }
@@ -221,4 +226,23 @@ void ddpi_paw3370_burst_wrapper(void) {
         STOCK_SENSOR_STATE_DX = out_dx;
         STOCK_SENSOR_STATE_DY = out_dy;
     }
+}
+
+/*
+ * Stock 2.4 GHz reply transmitter (0x15D74) sends feat[3] + 6 bytes, re-read per chunk. An
+ * open-directional-dpi reply keeps its status (0xA1..0xA4) in feat[3], which would stream ~170
+ * bytes and overrun the receiver's 64-byte reply buffer. Both length reads (0x15D8C, 0x15DB4)
+ * call this instead: r1 = min(feat[3] + 6, 64), r6 = feat buffer. Only r1 and the flags change
+ * (the next instruction is a cmp); stock replies are never longer than 64 bytes.
+ */
+__attribute__((naked, used, section(".text.entry_rf_len_clamp")))
+void ddpi_rf_reply_len_clamp(void) {
+    __asm__ volatile(
+        "ldrb r1, [r6, #3]\n\t"
+        "adds r1, r1, #6\n\t"
+        "cmp  r1, #64\n\t"
+        "it   hi\n\t"
+        "movhi r1, #64\n\t"
+        "bx   lr\n\t"
+    );
 }

@@ -618,7 +618,9 @@ const ANSWER_POLL_MS = 10;
  * are never transmitted to stock Glorious firmware.
  */
 export class OpenMouseDirectionalDpiClient {
-  private seq = 1;
+  /** Request sequence numbers stay in 5..255: stock Glorious firmware rejects body[4] >= 5
+   *  before running any handler, so a request can never trigger a stock command. */
+  private seq = 5;
   private readonly transport: WebHidFeatureTransport;
 
   constructor(transport: WebHidFeatureTransport) {
@@ -792,8 +794,8 @@ export class OpenMouseDirectionalDpiClient {
     mayNotAnswer = false
   ): Promise<Uint8Array> {
     const pkt = new Uint8Array(DDPI_HID_PACKET_LENGTH);
-    const seq = this.seq & 0xff;
-    this.seq = (this.seq + 1) & 0xff;
+    const seq = this.seq;
+    this.seq = this.seq >= 255 ? 5 : this.seq + 1;
 
     pkt[0] = 0x44; // 'D'
     pkt[1] = 0x50; // 'P'
