@@ -25,7 +25,7 @@ import {
   parseKovaaksKillTimes,
   selectKillFlicks,
 } from "../providers/kovaaks/index.ts";
-import { buildProfile } from "../cli.ts";
+import { buildProfile, FORMATS } from "../cli.ts";
 import { importProfileJson } from "../../integrations/openmouse/src/directional-dpi.ts";
 
 const here = (p: string): string => fileURLToPath(new URL(p, import.meta.url));
@@ -203,4 +203,60 @@ test("cli: mouse log -> profile JSON on stdout, usage errors", () => {
   const bad = run("kovaaks", join(dir, "log.csv"), here("fixtures/mousetester-log.csv"), "--dpi", "800");
   assert.equal(bad.status, 1);
   assert.match(bad.stderr, /not a KovaaK's Stats.csv/);
+
+  // an existing profile JSON (calibrate.html, odd_profile.py export) to another adapter's format
+  writeFileSync(join(dir, "profile.json"), ok.stdout);
+  const ev = run("format", join(dir, "profile.json"), "--format", "evdev", "--window", "0");
+  assert.equal(ev.status, 0, ev.stderr);
+  assert.match(ev.stdout, /^(\S+ ){8}0\n$/);
+  assert.equal(run("format", join(dir, "profile.json"), "--window", "129").status, 2);
+  assert.equal(run("format", join(dir, "profile.json"), "--format", "xml").status, 2);
+});
+
+test("cli: --window and the evdev, QMK and devicetree formats", () => {
+  const analyses = ingestMouseLog(syntheticSession(RATIOS));
+  const out = buildProfile(analyses, { dpi: 800, windowCounts: 0 });
+  const doc = JSON.parse(out.json);
+  assert.equal(doc.windowCounts, 0);
+  // Q8.8 in HID order E SE S SW W NW N NE (the JSON keys name HID directions)
+  const keys = ["E_0", "SE_45", "S_90", "SW_135", "W_180", "NW_225", "N_270", "NE_315"];
+  const hid = keys.map((k) => Math.round(doc.directionalMultipliers[k] * 256));
+
+  // odd_evdev_filter <dev> E SE S SW W NW N NE window; it parses each with strtod * 256 + 0.5
+  const ev = FORMATS.evdev!(out.profile).split(" ").map(Number);
+  assert.deepEqual(ev.slice(0, 8).map((v) => Math.floor(v * 256 + 0.5)), hid);
+  assert.equal(ev[8], 0);
+
+  const dts = FORMATS.dts!(out.profile);
+  assert.match(dts, new RegExp(`\tmultipliers-q8-8 = <${hid.join(" ")}>;`));
+  assert.match(dts, /\tbase-dpi = <800>;\n\tglobal-gain-q8-8 = <256>;/);
+  assert.match(dts, /\twindow-counts = <0>;\n\tidle-ms = <50>;/);
+
+  // The QMK lines compile against the QMK adapter (standalone mode) and set exactly this profile
+  const dir = mkdtempSync(join(tmpdir(), "odd-qmk-"));
+  writeFileSync(join(dir, "keymap.c"), `#include "${here("../../core/directional_dpi.h")}"
+#include <stdio.h>
+void           odd_qmk_init(uint16_t base_dpi);
+ddpi_engine_t *odd_qmk_get_engine(void);
+int main(void) {
+    odd_qmk_init(400u);
+${FORMATS.qmk!(out.profile)}
+    const ddpi_profile_v1_t *q = &odd_qmk_get_engine()->profile;
+    printf("%u %u %u", q->flags, q->base_dpi, q->global_gain_q8_8);
+    for (int i = 0; i < 8; i++) printf(" %u", q->multipliers_q8_8[i]);
+    printf(" %u\\n", q->reserved);
+    return 0;
+}
+`);
+  const cc = spawnSync("cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-o", join(dir, "keymap"),
+    join(dir, "keymap.c"), here("../../core/directional_dpi.c"), here("../../adapters/qmk/odd_pointing_device.c")],
+  { encoding: "utf8" });
+  assert.equal(cc.status, 0, cc.stderr);
+  assert.equal(spawnSync(join(dir, "keymap"), { encoding: "utf8" }).stdout, `1 800 256 ${hid.join(" ")} 0\n`);
+
+  // onlyAtBaseDpi: QMK knows the CPI; the evdev filter and the devicetree have no such setting
+  const only = buildProfile(analyses, { dpi: 800, onlyAtBaseDpi: true }).profile;
+  assert.match(FORMATS.qmk!(only), /p\.flags = DDPI_FLAG_ENABLED \| DDPI_FLAG_ONLY_AT_BASE_DPI;/);
+  assert.throws(() => FORMATS.evdev!(only), /odd_evdev_filter cannot take DDPI_FLAG_ONLY_AT_BASE_DPI/);
+  assert.throws(() => FORMATS.dts!(only), /devicetree cannot take DDPI_FLAG_ONLY_AT_BASE_DPI/);
 });

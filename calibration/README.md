@@ -10,9 +10,11 @@ No aim trainer exports that per flick (see [What the trainers export](#what-the-
 | `kovaaks` | Mouse log + the run's `Stats.csv` | KovaaK's static clicking scenarios (one click per kill, e.g. 1wall 6targets). Keeps only kill-to-kill flicks with no missed click in between |
 | `builtin` | Nothing to install | `providers/builtin/calibrate.html`, a center-out task in the browser that exports the profile itself |
 
+`mouse-log` and `kovaaks` have not been run on a real Aimlabs or KovaaK's session yet (2026-11-13). Their tests use made-up logs in the real file layouts.
+
 ## 1. Turn the current curve off
 
-The log sees motion after the mouse (or host filter) applied its curve, and the output is absolute, so calibrate with the curve off. Glorious: `python3 tools/odd_profile.py reset` (RAM only, without `--save`). evdev: stop the filter.
+The log sees motion after the mouse (or host filter) applied its curve, and the output is absolute, so calibrate with the curve off. Glorious: `python3 tools/odd_profile.py reset` (RAM only, without `--save`). Or **Turn curve off for calibration** in `calibrate.html` (Chrome or Edge; not yet tried on hardware). evdev: stop the filter.
 
 ## 2. Record a mouse log while you play
 
@@ -53,8 +55,12 @@ The profile JSON goes to stdout and a table to stderr: flicks per direction, med
 | `--normalization mean-preserving` | Default. Average gain 1.00x: corrects direction differences without changing overall sensitivity |
 | `--normalization cpi-headroom` | Gains scaled to ≤ 1.00x and `baseDpi` raised to match: set the sensor to the printed DPI. No direction gets 2-count steps |
 | `--normalization none` | Absolute gains (a general over- or undershoot also changes overall sensitivity), like `calibrate.html` |
+| `--window N` | Travel window in counts, 0..128 (0 = direction of each report). Default: DPI / 50.8 |
+| `--format json\|evdev\|qmk\|dts` | Output for an adapter (see step 5). Default `json` |
 
-`baseDpi` in the JSON is the DPI to run the sensor at, and `windowCounts` follows it (DPI / 50.8, about 0.5 mm).
+`baseDpi` in the JSON is the DPI to run the sensor at, and `windowCounts` follows it (DPI / 50.8, about 0.5 mm) unless you give `--window`.
+
+A window L > 0 needs the firmware to reset the direction estimator when the mouse stops. Without that reset, the first ~L counts of each flick still lean toward the previous flick's direction. The evdev filter, QMK and Zephyr adapters reset after an idle gap (default 50 ms). For the Glorious patch, see its notes in the [main README](../README.md#supported-mice--integration-routes); without a reset, use `--window 0`.
 
 ## 5. Load it onto the mouse
 
@@ -62,7 +68,17 @@ The profile JSON goes to stdout and a table to stderr: flicks per direction, med
 python3 tools/odd_profile.py load profile.json --save
 ```
 
-Or import the file in OpenMouse (`importProfileJson`). For `--only-at-dpi`, the curve is active only while the mouse is on the `baseDpi` stage.
+`tools/odd_profile.py` runs on Linux (cable or 2.4 GHz receiver). On Windows or macOS, **Send to mouse** in `calibrate.html` (Chrome or Edge) sends a profile calibrated in that page (not yet tried on hardware, 2026-11-13); there is no Windows or macOS loader for a `cli.ts` profile yet. The OpenMouse app cannot load the profile yet. For `--only-at-dpi`, the curve is active only while the mouse is on the `baseDpi` stage.
+
+The other adapters take the same profile in their own format. Convert a profile JSON (from this CLI, `calibrate.html` or `odd_profile.py export`) with `cli.ts format profile.json --format <name>`, or pass `--format` to the calibration run:
+
+| `--format` | Adapter | Output |
+| :--- | :--- | :--- |
+| `evdev` | `adapters/linux-evdev` | The arguments after the device: `sudo adapters/linux-evdev/odd_evdev_filter /dev/input/eventX $(node --experimental-strip-types calibration/cli.ts format profile.json --format evdev)` |
+| `qmk` | `adapters/qmk` | Lines for `keyboard_post_init_user()` in `keymap.c`, after `odd_qmk_init()` |
+| `dts` | `adapters/zephyr` | Properties for the `odd,directional-dpi` node |
+
+The evdev filter and the devicetree have no `onlyAtBaseDpi` setting, so `--format evdev` and `dts` refuse such a profile. None of them sets the sensor DPI: set it to `baseDpi` (the CLI prints it).
 
 ## What the trainers export
 
