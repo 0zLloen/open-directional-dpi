@@ -1,0 +1,52 @@
+Kill #,Timestamp,Bot,Weapon,TTK,Shots,Hits,Accuracy,Damage Done,Damage Possible,Efficiency,Cheated,OverShots
+1,18:59:34.330,target,BB Gun,0.000000s,1,1,1.000000,1.000000,1.000000,1.000000,0,0
+2,18:59:34.632,target,BB Gun,0.000000s,1,1,1.000000,1.000000,1.000000,1.000000,0,0
+3,18:59:35.028,target,BB Gun,0.280000s,2,1,0.500000,1.000000,2.000000,0.500000,0,0
+4,18:59:35.335,target,BB Gun,0.000000s,1,1,1.000000,1.000000,1.000000,1.000000,0,0
+
+Weapon,Shots,Hits,Damage Done,Damage Possible,,Sens Scale,Horiz Sens,Vert Sens,FOV,Hide Gun,Crosshair,Crosshair Scale,Crosshair Color,ADS Sens,ADS Zoom Scale,Avg Target Scale,Avg Time Dilation
+BB Gun,5,4,4.0,5.0,
+
+Kills:,4
+Deaths:,0
+Fight Time:,1.005
+Time Remaining:,0.0
+Avg TTK:,0.070000
+Damage Done:,4.0
+Total Overshots:,0
+Damage Taken:,0.0
+Hit Count:,4
+Miss Count:,1
+Midairs:,0
+Midaired:,0
+Directs:,0
+Directed:,0
+Reloads:,0
+Distance Traveled:,0.0
+MBS Points:,0.0
+Score:,4.0
+Scenario:,Example Static Clicking
+Hash:,00000000000000000000000000000000
+Game Version:,3.9.1.2026-05-06-17-06-54-4967be094932
+Challenge Start:,18:59:34.000
+Pause Count:,0
+Pause Duration:,0
+Avg Target Scale:,1.0
+Avg Time Dilation:,1.0
+
+Input Lag:,0
+Max FPS (config):,999.0
+Sens Scale:,cm/360
+Sens Increment:,0.1
+Horiz Sens:,30.0
+Vert Sens:,30.0
+DPI:,800
+FOV:,103.0
+FOVScale:,Overwatch
+Hide Gun:,false
+Crosshair:,ch.png
+Crosshair Scale:,1.0
+Crosshair Color:,FFFFFFFF
+Resolution:,1920x1080
+Avg FPS:,240.0
+Resolution Scale:,100.0

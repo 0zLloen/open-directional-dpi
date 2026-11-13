@@ -14,7 +14,7 @@ Thank you for contributing to an open, vendor-neutral standard and portable refe
    - `make -C tests test` (16/16 C unit tests).
    - `make -C tests vectors && git diff --exit-code -- tests/vectors` (vectors still match the engine).
    - `node --experimental-strip-types --test integrations/openmouse/test/directional-dpi.test.ts` (17/17 OpenMouse suites, including parity with the 2592 C vectors; Node >= 22.6).
-   - `node --experimental-strip-types --test calibration/tests/calibration.test.ts` (4/4 calibration suites).
+   - `node --experimental-strip-types --test calibration/tests/*.test.ts` (calibration pipeline and trainer providers).
    - `make -C adapters/linux-evdev check` (evdev filter build and self-test).
    - `make -C adapters/glorious-cm2856 check` when touching `core/` or the patch (needs `arm-none-eabi-gcc`; fails on PATCH_ROM overflow, `.bss`/`.data`, libgcc helpers, or SRAM overlap with the bootloader magic word).
    - For `adapters/zephyr/`: `$ZEPHYR_BASE/scripts/twister -T adapters/zephyr/tests -p native_sim/native/64` (see `adapters/zephyr/README.md`).

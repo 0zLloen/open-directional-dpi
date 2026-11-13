@@ -17,9 +17,6 @@ import {
   createBuiltinTrialSchedule,
   ingestBuiltinSession,
 } from "../providers/builtin/index.ts";
-import { ingestAimFrogeSession } from "../providers/aimfroge/index.ts";
-import { parseKovaaksDirectionalCsv } from "../providers/kovaaks/index.ts";
-import { ingestAimlabsExport } from "../providers/aimlabs/index.ts";
 import {
   DDPI_FLAG_ENABLED,
   DDPI_FLAG_FRAME_SENSOR_CCW,
@@ -118,56 +115,10 @@ test("Calibration Pipeline — Trajectory Analysis, Error Aggregation, Profile G
     "  [PASS] 03. Profile generator produces smoothed CCW gains, CPI headroom, and signed 28-byte firmware profile"
   );
 
-  // 3. Test AimFroge, KovaaK's, and Aimlabs providers
+  // 3. Built-in provider (trainer providers: providers.test.ts)
   const builtinOut = ingestBuiltinSession([overshootTrial]);
   assert.equal(builtinOut.length, 1);
-
-  const aimFrogeOut = ingestAimFrogeSession({
-    version: "1.0",
-    scenarioName: "Center-Out 8-Way",
-    baseCpi: 800,
-    flicks: [
-      {
-        originX: 500,
-        originY: 500,
-        targetX: 700,
-        targetY: 500,
-        targetRadius: 12,
-        trace: overshootTrial.samples.map((s) => ({
-          x: 500 + s.x,
-          y: 500 + s.y,
-          timestampMs: s.tMs,
-        })),
-      },
-    ],
-  });
-  assert.equal(aimFrogeOut.length, 1);
-  assert.ok(Math.abs(aimFrogeOut[0]!.radialRatio - 1.2) < 1e-6);
-
-  const kovaaksOut = parseKovaaksDirectionalCsv(
-    `TargetDX,TargetDY,InitialLandingDX,InitialLandingDY,PathLength,Submovements\n` +
-      `0,-200,0,-180,205,2\n` +
-      `0,200,0,240,250,2\n`
-  );
-  assert.equal(kovaaksOut.length, 2);
-  assert.equal(kovaaksOut[0]!.sectorCcw, 2); // Away (-Y_HID)
-  assert.ok(Math.abs(kovaaksOut[0]!.radialRatio - 0.9) < 1e-6);
-  assert.equal(kovaaksOut[1]!.sectorCcw, 6); // Toward (+Y_HID)
-  assert.ok(Math.abs(kovaaksOut[1]!.radialRatio - 1.2) < 1e-6);
-
-  const aimlabsOut = ingestAimlabsExport({
-    taskName: "SpiderShot Directional",
-    trials: [
-      { angleCcwDeg: 90, targetDistance: 200, initialFlickDistance: 180 },
-      { angleCcwDeg: 270, targetDistance: 200, initialFlickDistance: 240 },
-    ],
-  });
-  assert.equal(aimlabsOut.length, 2);
-  assert.equal(aimlabsOut[0]!.sectorCcw, 2);
-  assert.equal(aimlabsOut[1]!.sectorCcw, 6);
-  console.log(
-    "  [PASS] 04. All 4 calibration providers (builtin, aimfroge, kovaaks, aimlabs) parse and normalize trials"
-  );
+  console.log("  [PASS] 04. Built-in provider ingests a center-out trial");
 
   console.log("\nAll 4/4 calibration test suites passed.");
 });
