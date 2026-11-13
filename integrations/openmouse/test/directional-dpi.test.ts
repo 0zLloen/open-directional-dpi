@@ -18,6 +18,7 @@ import {
   DDPI_FLAG_FRAME_SENSOR_CCW,
   DDPI_FLAG_KEEP_REMAINDER_ON_REVERSE,
   DDPI_FLAG_MODEL_LINEAR_2X2,
+  DDPI_FLAG_ONLY_AT_BASE_DPI,
   DDPI_Q16_16_ONE,
   DdpiDirection,
   type DdpiProfileV1,
@@ -448,7 +449,27 @@ async function runTests(): Promise<void> {
     console.log("  [PASS] 17. Late answers are waited for and matched by seq/opcode; calibration bypass");
   }
 
-  console.log("\nAll 17/17 OpenMouse integration test suites passed.");
+  {
+    /* 18. Single DPI stage: JSON round trip, old JSON defaults to off, sensor DPI in capabilities */
+    const p = createDefaultProfileV1(800);
+    p.flags = DDPI_FLAG_ENABLED | DDPI_FLAG_ONLY_AT_BASE_DPI;
+    p.multipliersQ8_8[DdpiDirection.N] = 128;
+    const json = exportProfileJson(p);
+    assert.equal(JSON.parse(json).onlyAtBaseDpi, true);
+    assert.equal(importProfileJson(json).flags & DDPI_FLAG_ONLY_AT_BASE_DPI, DDPI_FLAG_ONLY_AT_BASE_DPI);
+    const old = JSON.parse(json);
+    delete old.onlyAtBaseDpi;
+    assert.equal(importProfileJson(JSON.stringify(old)).flags & DDPI_FLAG_ONLY_AT_BASE_DPI, 0);
+
+    const mock = new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1");
+    const client = new OpenMouseDirectionalDpiClient(mock);
+    assert.equal((await client.detectCapabilities()).sensorDpi, 0);
+    mock.sensorDpi = 1600;
+    assert.equal((await client.detectCapabilities()).sensorDpi, 1600);
+    console.log("  [PASS] 18. Single DPI stage flag (JSON) and sensor DPI in capabilities");
+  }
+
+  console.log("\nAll 18/18 OpenMouse integration test suites passed.");
 }
 
 runTests().catch((err) => {

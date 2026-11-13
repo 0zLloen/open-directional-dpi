@@ -55,6 +55,7 @@ extern "C" {
 #define DDPI_FLAG_MODEL_LINEAR_2X2           (1u << 4) /* Stateless 2x2 matrix model using E/N/NE/NW gains */
 #define DDPI_FLAG_RESET_REMAINDER_ON_REVERSE (1u << 5) /* Clear axis remainder when raw delta flips sign */
 #define DDPI_FLAG_BYPASS_FOR_CALIBRATION     (1u << 6) /* Temporary 1.00x bypass during calibration runs */
+#define DDPI_FLAG_ONLY_AT_BASE_DPI           (1u << 7) /* Single DPI stage: curve only while the sensor runs at base_dpi */
 
 /** USB HID Status Codes (compatible with Compx 0xA1..0xA4 convention) */
 #define DDPI_STATUS_OK              0xA1u
@@ -133,6 +134,7 @@ typedef struct {
     uint8_t           last_octant;         /* Most recent octant index (0..7) */
     uint32_t          last_scale_q16_16;   /* Most recent effective scale (Q16.16) */
     uint32_t          last_motion_ms;      /* Timestamp of last non-zero motion (ddpi_process_motion) */
+    uint16_t          sensor_dpi;          /* Current sensor DPI reported by the adapter (0 = unknown) */
 } ddpi_engine_t;
 
 /**
@@ -225,6 +227,15 @@ void ddpi_engine_reset_remainders(ddpi_engine_t *engine);
  * so the travel-window direction estimator resets cleanly before the next flick.
  */
 void ddpi_engine_notify_idle(ddpi_engine_t *engine);
+
+/**
+ * Tell the engine which DPI the sensor currently runs at (0 = unknown). Adapters that
+ * know it (the firmware owns the DPI stages) call this before processing motion. With
+ * DDPI_FLAG_ONLY_AT_BASE_DPI the curve then applies only while sensor_dpi == base_dpi,
+ * like a curve bound to one DPI stage; other stages pass through unchanged. While it
+ * is unknown the flag has no effect. A change of DPI clears remainders and direction.
+ */
+void ddpi_engine_set_sensor_dpi(ddpi_engine_t *engine, uint16_t sensor_dpi);
 
 /**
  * Load a validated profile into the runtime engine (clamping parameters to safe bounds).

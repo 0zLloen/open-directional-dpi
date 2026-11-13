@@ -90,13 +90,14 @@ open-directional-dpi/
    - Uses `requestPointerLock({ unadjustedMovement: true })` to measure primary-submovement overshoot/undershoot in 8 directions and exports an `open-directional-dpi-v1` JSON profile that OpenMouse `importProfileJson` accepts.
    - Calibrate with the curve off: the page sees motion after the mouse (or host filter) applied the active curve, and exports absolute gains, so a recalibration through an active curve undoes the previous one. HID mice: `bypassForCalibration()` in OpenMouse (exact 1.00x, end it with `setEnabled()`) or disable the curve. evdev: stop the filter. QMK / devicetree curves: flash a flat curve first.
 5. **Conformance vectors (`tests/vectors/`):** 2592 scale/octant results from the C engine; the TypeScript mirror must match every one.
+6. **Single DPI stage (like Corsair PureVector):** a profile with `onlyAtBaseDpi` (flag bit 7) applies only while the sensor runs at its `baseDpi`; every other DPI stage passes through unchanged. It needs firmware that reports the current DPI: the Glorious patch (reads the stock firmware's active DPI) and QMK (`pointing_device_get_cpi()`). Elsewhere the flag has no effect and the curve applies at every DPI. In `calibrate.html`, tick "Only at this DPI" and enter that stage's DPI as the base CPI.
 
 ---
 
 ## Quick Start: Run All Checks
 
 ```bash
-# C engine: 16 unit tests
+# C engine: 17 unit tests
 make -C tests test
 
 # Conformance vectors: regenerate from the engine; the diff must be empty

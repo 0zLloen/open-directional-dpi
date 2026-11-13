@@ -62,6 +62,8 @@ export class MockGloriousSeriesOneProHidDevice implements WebHidFeatureTransport
   public featurePacketsReceived = 0;
   /** Packets framed as Open Directional DPI ('D','P' .. 0xDF) */
   public oddPacketsReceived = 0;
+  /** Sensor DPI the mock firmware reports in GET_CAPABILITIES (0 = unknown) */
+  public sensorDpi = 0;
 
   /* One live profile (max_slots = 1, the slot byte is ignored) and its flash copy */
   private profile = createDefaultProfileV1(800);
@@ -148,6 +150,8 @@ export class MockGloriousSeriesOneProHidDevice implements WebHidFeatureTransport
         dv.setUint16(14, DDPI_Q8_8_MAX, true);
         payload[16] = DDPI_DEFAULT_WINDOW_COUNTS;
         payload[17] = DDPI_MAX_WINDOW_COUNTS;
+        dv.setUint16(18, this.sensorDpi, true);
+        if (this.sensorDpi !== 0) payload[7] |= 0x40; // sensor_dpi known
         break;
       }
 

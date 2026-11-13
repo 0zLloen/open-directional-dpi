@@ -96,8 +96,9 @@
     <p style="color: var(--warn)"><strong>Turn the directional curve off first.</strong> The browser sees motion after the mouse or host filter has applied it, so a calibration through an active curve is relative to it and recalibrating undoes the last one. OpenMouse: calibration bypass (<code>bypassForCalibration()</code>) or disable the curve; Linux: stop <code>odd_evdev_filter</code>; QMK and devicetree curves: flash a flat curve.</p>
     <div class="controls">
       <label>Base Sensor CPI <input type="number" id="baseCpi" value="800" min="50" max="65535" step="50" /></label>
+      <label><input type="checkbox" id="onlyAtBaseDpi" /> Only at this DPI (one DPI stage, like Corsair PureVector)</label>
       <label>Trials per Direction <input type="number" id="trialsPerDir" value="8" min="3" max="40" /></label>
-      <label>Travel Window L (counts) <input type="number" id="windowCounts" value="16" min="0" max="128" /></label>
+      <label>Travel Window L (counts, about 0.5 mm: follows the CPI) <input type="number" id="windowCounts" value="16" min="0" max="128" /></label>
       <button class="primary" id="startBtn">Start Calibration (Pointer Lock)</button>
       <button id="exportBtn">Download profile JSON (OpenMouse import)</button>
     </div>
@@ -164,8 +165,9 @@
     // Canonical open-directional-dpi-v1 JSON. gainsCcw[i] is CCW sector i (0 right,
     // 1 away-right, 2 away ... 7 toward-right); directionalMultipliers always uses
     // physical HID keys, so CCW sector i is HID direction (8 - i) % 8. Gains are not
-    // normalized (profile-generation's "none"): keep the sensor at baseCpi.
-    function buildProfileJson(gainsCcw, baseCpi, windowCounts) {
+    // normalized (profile-generation's "none"): keep the sensor at baseCpi. onlyAtBaseDpi binds
+    // the curve to the DPI stage that runs at baseCpi (firmware that reports its DPI).
+    function buildProfileJson(gainsCcw, baseCpi, windowCounts, onlyAtBaseDpi = false) {
       const keys = ["E_0", "SE_45", "S_90", "SW_135", "W_180", "NW_225", "N_270", "NE_315"];
       return {
         schema: "open-directional-dpi-v1",
@@ -175,12 +177,19 @@
         model: "angular-gain",
         windowCounts,
         idleResetMs: 50,
+        onlyAtBaseDpi,
         baseDpi: baseCpi,
         globalGain: 1,
         directionalMultipliers: Object.fromEntries(keys.map((k, dir) => [k, gainsCcw[(8 - dir) % 8]])),
       };
     }
     // --- end profile export ---
+
+    // Keep the travel window near 0.5 mm when the CPI changes (16 counts at 800 CPI)
+    document.getElementById("baseCpi").addEventListener("input", (e) => {
+      const cpi = Number(e.target.value);
+      if (cpi >= 50) document.getElementById("windowCounts").value = Math.min(128, Math.max(1, Math.round(cpi / 50.8)));
+    });
 
     function updateTableAndJson() {
       const gains = computeGains();
@@ -193,7 +202,8 @@
 
       const baseCpi = Math.min(65535, Math.max(50, Math.round(Number(document.getElementById("baseCpi").value) || 800)));
       const w = parseInt(document.getElementById("windowCounts").value, 10);
-      const profile = buildProfileJson(gains, baseCpi, Number.isNaN(w) ? 16 : Math.min(128, Math.max(0, w)));
+      const profile = buildProfileJson(gains, baseCpi, Number.isNaN(w) ? 16 : Math.min(128, Math.max(0, w)),
+        document.getElementById("onlyAtBaseDpi").checked);
       document.getElementById("profileJson").textContent = JSON.stringify(profile, null, 2);
       return profile;
     }

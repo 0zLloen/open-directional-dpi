@@ -465,6 +465,61 @@ static void test_high_cpi_range(void) {
     assert(cpi == DDPI_DPI_MAX);
 }
 
+static void test_single_dpi_stage(void) {
+    ddpi_engine_t e;
+    ddpi_engine_init(&e, 800u);
+    ddpi_profile_v1_t p = e.profile;
+    p.flags = DDPI_FLAG_ENABLED | DDPI_FLAG_ONLY_AT_BASE_DPI;
+    p.multipliers_q8_8[DDPI_DIR_N] = 128; /* up (-Y) at 0.50x */
+    ddpi_engine_set_profile(&e, &p);
+    int16_t ox, oy;
+
+    /* Sensor DPI unknown: the flag has no effect, the curve applies */
+    ddpi_process_delta(&e, 0, -100, &ox, &oy);
+    assert(ox == 0 && oy == -50);
+
+    /* Bound stage: curve applies */
+    ddpi_engine_set_sensor_dpi(&e, 800u);
+    ddpi_process_delta(&e, 0, -100, &ox, &oy);
+    assert(oy == -50);
+    ddpi_process_delta(&e, 0, -1, &ox, &oy); /* leaves a -0.5 remainder */
+    assert(oy == 0 && e.rem_y_q16_16 != 0);
+
+    /* Another stage: exact passthrough, and the stage change dropped the remainder */
+    ddpi_engine_set_sensor_dpi(&e, 1600u);
+    assert(e.rem_y_q16_16 == 0);
+    ddpi_process_delta(&e, 0, -100, &ox, &oy);
+    assert(ox == 0 && oy == -100);
+    ddpi_process_delta(&e, 37, -1, &ox, &oy);
+    assert(ox == 37 && oy == -1);
+
+    /* Back to the bound stage */
+    ddpi_engine_set_sensor_dpi(&e, 800u);
+    ddpi_process_delta(&e, 0, -100, &ox, &oy);
+    assert(oy == -50);
+
+    /* Without the flag every stage gets the curve */
+    p.flags = DDPI_FLAG_ENABLED;
+    ddpi_engine_set_profile(&e, &p);
+    ddpi_engine_set_sensor_dpi(&e, 1600u);
+    ddpi_process_delta(&e, 0, -100, &ox, &oy);
+    assert(oy == -50);
+
+    /* Capabilities report the sensor DPI (bytes 18..19) and bit 6; RESET_DEFAULTS keeps it */
+    uint8_t req[DDPI_HID_PACKET_LEN] = {0x44, 0x50, DDPI_PROFILE_VERSION, 0, 7, DDPI_HID_NAMESPACE, DDPI_CMD_GET_CAPABILITIES};
+    uint8_t resp[DDPI_HID_PACKET_LEN];
+    uint16_t crc = ddpi_crc16_ccitt(req, 62u);
+    req[62] = (uint8_t)crc; req[63] = (uint8_t)(crc >> 8);
+    assert(ddpi_hid_handle_feature_report(&e, req, resp, NULL, NULL));
+    assert(resp[3] == DDPI_STATUS_OK && (resp[8 + 7] & 0x40u) != 0u);
+    assert((uint16_t)(resp[8 + 18] | (resp[8 + 19] << 8)) == 1600u);
+    req[6] = DDPI_CMD_RESET_DEFAULTS;
+    crc = ddpi_crc16_ccitt(req, 62u);
+    req[62] = (uint8_t)crc; req[63] = (uint8_t)(crc >> 8);
+    assert(ddpi_hid_handle_feature_report(&e, req, resp, NULL, NULL));
+    assert(e.sensor_dpi == 1600u);
+}
+
 int main(void) {
     printf("=== Open Directional DPI v1 — Portable C Reference Engine Tests ===\n");
     RUN_TEST(test_neutral_identity_passthrough);
@@ -483,6 +538,7 @@ int main(void) {
     RUN_TEST(test_process_motion_idle_reset);
     RUN_TEST(test_hid_null_callbacks_unsupported);
     RUN_TEST(test_high_cpi_range);
+    RUN_TEST(test_single_dpi_stage);
 
     printf("\nAll %d/%d tests passed.\n", g_tests_passed, g_tests_run);
     return (g_tests_passed == g_tests_run) ? 0 : 1;

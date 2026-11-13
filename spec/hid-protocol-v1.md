@@ -91,17 +91,18 @@ Unless stated otherwise, commands act on the live engine in RAM, and an unknown 
 | `4` | `engine_version` | `0x01` |
 | `5` | `max_slots` | `1` |
 | `6` | `active_slot` | `0` |
-| `7` | capability flags | bit1 `nvs_storage` (save callback present), bit3 `bootloader_reentry` (bootloader callback present), bit4 `travel_window` (always), bit5 `linear_2x2` (always). Bits 0 (`wired_1000hz`) and 2 (`paw3370_sensor`) are legacy and never set by the reference handler. |
+| `7` | capability flags | bit1 `nvs_storage` (save callback present), bit3 `bootloader_reentry` (bootloader callback present), bit4 `travel_window` (always), bit5 `linear_2x2` (always), bit6 `sensor_dpi` (the adapter reports the current sensor DPI, so profile flag bit 7 `ONLY_AT_BASE_DPI` works). Bits 0 (`wired_1000hz`) and 2 (`paw3370_sensor`) are legacy and never set by the reference handler. |
 | `8..9` | `min_dpi` | `50` |
 | `10..11` | `max_dpi` | `65535` |
 | `12..13` | `min_mult_q8_8` | `0x0010` |
 | `14..15` | `max_mult_q8_8` | `0x0400` |
 | `16` | `window_default` | `16` (recommended travel window; the neutral default profile itself has `L = 0`) |
 | `17` | `window_max` | `128` |
+| `18..19` | `sensor_dpi` | Current sensor DPI as reported by the adapter (`uint16_le`), `0` = unknown |
 
 ---
 
 ## 5. Per-Route Behaviour
 
-- **Glorious stock patch**: flags `0x3A` (save, bootloader, travel window, 2×2). `SAVE_FLASH` writes the profile to flash page `0x0007E000`, which is loaded at boot (otherwise the neutral 800-CPI default). `ENTER_BOOTLOADER` writes `0xA55AA55A` to `0x2003FFFC` and resets into the Compx bootloader (`258a:2103`); holding LMB + RMB + DPI at power-up does the same. No idle reset of the direction estimator (no verified stock millisecond tick).
+- **Glorious stock patch**: flags `0x7A` (save, bootloader, travel window, 2×2). `SAVE_FLASH` writes the profile to flash page `0x0007E000`, which is loaded at boot (otherwise the neutral 800-CPI default). `ENTER_BOOTLOADER` writes `0xA55AA55A` to `0x2003FFFC` and resets into the Compx bootloader (`258a:2103`); holding LMB + RMB + DPI at power-up does the same. No idle reset of the direction estimator (no verified stock millisecond tick). It reports the active DPI (`sensor_dpi`, capabilities bytes `18..19`) from the stock firmware's own variable at `0x20003068`, so `ONLY_AT_BASE_DPI` profiles follow the DPI button; verified on a retail mouse cycling 400/800/1600/3200 (2026-11-13). A held DPI-shift key changes the sensor without updating that variable.
 - **Zephyr filter**: flags `0x30`, plus `0x02` with `CONFIG_SETTINGS`. `SAVE_FLASH` answers OK at once and writes the profile to settings key `odd/<devicetree node name>` `CONFIG_ODD_DIRECTIONAL_DPI_SAVE_DELAY_MS` (default 500 ms) later. `ENTER_BOOTLOADER` answers `0xA3` unless the board intercepts opcode `0x0F` before calling the filter.
