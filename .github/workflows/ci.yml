@@ -49,12 +49,10 @@ jobs:
           make -C adapters/linux-evdev clean
           make -C adapters/linux-evdev check
 
-      # The raw HID transport (RAW_ENABLE) also runs in `make -C tests test` (test_qmk_raw_hid)
-      - name: Compile QMK pointing-device adapter (8-bit and extended reports, raw HID)
+      - name: Compile QMK pointing-device adapter (8-bit and extended reports, raw HID) and test its raw HID transport
         run: |
-          gcc -std=c11 -Wall -Wextra -Werror -pedantic -c adapters/qmk/odd_pointing_device.c -o /dev/null
-          gcc -std=c11 -Wall -Wextra -Werror -pedantic -DMOUSE_EXTENDED_REPORT -c adapters/qmk/odd_pointing_device.c -o /dev/null
-          gcc -std=c11 -Wall -Wextra -Werror -pedantic -DRAW_ENABLE -c adapters/qmk/odd_pointing_device.c -o /dev/null
+          make -C adapters/qmk clean
+          make -C adapters/qmk check
 
       # The step above uses the adapter's stand-in types. This one uses QMK's own report.h,
       # pointing_device.h, timer.h, eeconfig.h and raw_hid.h (headers only, no keyboard build); -include makes the

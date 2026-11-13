@@ -4,7 +4,7 @@ name: Pages
 on:
   push:
     branches: [main]
-    paths: ["calibration/providers/builtin/calibrate.html", ".github/workflows/pages.yml"]
+    paths: ["web/calibrate.html", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:
@@ -37,8 +37,8 @@ jobs:
       - name: Stage the page only
         run: |
           mkdir _site
-          cp calibration/providers/builtin/calibrate.html _site/index.html
-          cp calibration/providers/builtin/calibrate.html _site/calibrate.html
+          cp web/calibrate.html _site/index.html
+          cp web/calibrate.html _site/calibrate.html
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:

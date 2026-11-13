@@ -197,6 +197,7 @@ test("cli: mouse log -> profile JSON on stdout, usage errors", () => {
   assert.equal(ok.status, 0, ok.stderr);
   assert.equal(importProfileJson(ok.stdout).baseDpi, 800);
   assert.match(ok.stderr, /set the sensor to 800 DPI/);
+  assert.equal(run("aimlabs", join(dir, "log.csv"), "--dpi", "800").stdout, ok.stdout); // alias of mouse-log
 
   assert.equal(run("mouse-log", join(dir, "log.csv")).status, 2); // no --dpi
   assert.equal(run("kovaaks", join(dir, "log.csv"), "--dpi", "800").status, 2); // no Stats.csv

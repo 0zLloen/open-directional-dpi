@@ -28,7 +28,7 @@ adapters/build/
 build/
 twister-out*/
 tests/test_directional_dpi
-tests/test_qmk_raw_hid
+adapters/qmk/tests/test_qmk_raw_hid
 tests/gen_vectors
 tests/vectors/*.tmp
 adapters/linux-evdev/odd_evdev_filter

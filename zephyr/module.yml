@@ -1,3 +1,5 @@
+# Zephyr finds a module by zephyr/module.yml at its root, so this file has to stay here at the repo
+# root (west.yml or ZEPHYR_EXTRA_MODULES point at the repo). The module's code is in adapters/zephyr.
 name: open-directional-dpi
 build:
   cmake: adapters/zephyr

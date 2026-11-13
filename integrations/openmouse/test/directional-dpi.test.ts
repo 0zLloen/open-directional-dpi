@@ -337,7 +337,7 @@ async function runTests(): Promise<void> {
   /* Test 14: calibrate.html export imports with each CCW gain on its physical direction */
   {
     const html = readFileSync(
-      new URL("../../../calibration/providers/builtin/calibrate.html", import.meta.url),
+      new URL("../../../web/calibrate.html", import.meta.url),
       "utf8"
     );
     const src = /\/\/ --- profile export[^\n]*\n([\s\S]*?)\/\/ --- end profile export ---/.exec(html)?.[1];

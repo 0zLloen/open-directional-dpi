@@ -6,15 +6,20 @@ No aim trainer exports that per flick (see [What the trainers export](#what-the-
 
 | Provider | Input | Use with |
 | :--- | :--- | :--- |
-| `mouse-log` | Mouse log | Aimlabs SpiderShot (the task Corsair PureVector calibrates with), or any task with static targets and one click per target |
+| `mouse-log` (also `aimlabs`) | Mouse log | Aimlabs SpiderShot (the task Corsair PureVector calibrates with), or any task with static targets and one click per target |
 | `kovaaks` | Mouse log + the run's `Stats.csv` | KovaaK's static clicking scenarios (one click per kill, e.g. 1wall 6targets). Keeps only kill-to-kill flicks with no missed click in between |
-| `builtin` | Nothing to install | `providers/builtin/calibrate.html` (hosted at <https://0zlloen.github.io/open-directional-dpi/>), a center-out task in the browser that exports the profile itself. Local copy: `python3 -m http.server` in `providers/builtin`, then `http://localhost:8000/calibrate.html` |
+| `builtin` | Nothing to install | [`web/calibrate.html`](../web/calibrate.html) (hosted at <https://0zlloen.github.io/open-directional-dpi/>), a center-out task in the browser that exports the profile itself. Local copy: `python3 -m http.server` in `web`, then `http://localhost:8000/calibrate.html` |
 
 `mouse-log` and `kovaaks` have not been run on a real Aimlabs or KovaaK's session yet (2026-11-13). Their tests use made-up logs in the real file layouts.
 
 ## 1. Turn the current curve off
 
-The log sees motion after the mouse (or host filter) applied its curve, and the output is absolute, so calibrate with the curve off. Glorious: `python3 tools/odd_profile.py reset` (RAM only, without `--save`). Or **Turn curve off for calibration** in [`calibrate.html`](https://0zlloen.github.io/open-directional-dpi/) (Chrome or Edge; not yet tried on hardware). evdev: stop the filter.
+The log sees motion after the mouse (or host filter) applied its curve, and the output is absolute, so calibrate with the curve off:
+
+- Glorious: `python3 tools/odd_profile.py reset` (RAM only, without `--save`). Or **Turn curve off for calibration** in [`calibrate.html`](https://0zlloen.github.io/open-directional-dpi/) (Chrome or Edge; not yet tried on hardware).
+- Other HID firmware, including QMK with raw HID: `SET_ENABLED` mode 2 (`bypassForCalibration()` in `integrations/openmouse`, exact 1.00x, end it with `setEnabled()`).
+- evdev: stop the filter.
+- QMK without raw HID / devicetree curves: flash a flat curve first.
 
 ## 2. Record a mouse log while you play
 
@@ -33,7 +38,7 @@ Start the log just before the task and stop it right after. Clicks in menus beco
 
 ## 3. Play
 
-- **Aimlabs:** SpiderShot. PureVector uses five rounds of it; aim for at least 10 flicks per direction (the CLI warns about directions with fewer than 5). Use `mouse-log`.
+- **Aimlabs:** SpiderShot. PureVector uses five rounds of it; aim for at least 10 flicks per direction (the CLI warns about directions with fewer than 5). Use `mouse-log` (or `aimlabs`, the same provider).
 - **KovaaK's:** a static clicking scenario with a one-click weapon and no reload pauses (1wall 6targets small or similar). Play several runs in one log. Use `kovaaks` with each run's file from `steamapps/common/FPSAimTrainer/FPSAimTrainer/stats/` (`<Scenario> - Challenge - <date> Stats.csv`). A scenario with hold-to-fire or several hits per kill fails with "kills don't line up with clicks".
 - **Anything else:** any task where each target is static and taken with one click. A miss splits a flick in two; enough misses make the result noisy.
 
@@ -60,7 +65,7 @@ The profile JSON goes to stdout and a table to stderr: flicks per direction, med
 
 `baseDpi` in the JSON is the DPI to run the sensor at, and `windowCounts` follows it (DPI / 50.8, about 0.5 mm) unless you give `--window`.
 
-A window L > 0 needs the firmware to reset the direction estimator when the mouse stops. Without that reset, the first ~L counts of each flick still lean toward the previous flick's direction. The evdev filter, QMK and Zephyr adapters reset after an idle gap (default 50 ms). For the Glorious patch, see its notes in the [main README](../README.md#supported-mice--integration-routes); without a reset, use `--window 0`.
+A window L > 0 needs the firmware to reset the direction estimator when the mouse stops. Without that reset, the first ~L counts of each flick still lean toward the previous flick's direction. The evdev filter, QMK and Zephyr adapters reset after an idle gap (default 50 ms). For the Glorious patch, see its [idle-reset clock](../adapters/glorious-cm2856/README.md#idle-reset-clock); without a reset, use `--window 0`.
 
 ## 5. Load it onto the mouse
 
