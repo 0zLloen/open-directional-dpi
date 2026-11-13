@@ -5,11 +5,14 @@ hidapi module (stdlib only, no hardware).
 The fakes replace the I/O layer (Hidraw, or the hid module behind Hidapi), so Device and find_device run as they are.
 The cable and receiver follow spec/hid-protocol-v1.md 2.3 (verified on a retail mouse, 2026-11-13): the receiver
 forwards a request only when body[2] = 0x02, forwards and copies back body[3] + 6 bytes (the rest of its buffer is
-stale), shows 0xA0 while the request is pending and 0xA4 while the mouse is unreachable. The QMK boards follow spec
+stale), shows 0xA0 while the request is pending and 0xA4 while the mouse is unreachable, and answers its own link-state
+query 0x89 (body[6] = 1 linked; 0 unlinked is inferred from its disassembly). The QMK boards follow spec
 6.2/6.3 (inferred from the QMK and vial-qmk sources, not run on a board). Time is virtual, so nothing sleeps.
 Run: python3 tools/test_odd_profile.py
 """
 
+import contextlib
+import io
 import struct
 import sys
 import tempfile
@@ -20,6 +23,7 @@ from unittest import mock
 import odd_profile as op
 
 STOCK_VERSION = bytes.fromhex("a10000030081010000002018")  # stock v1.0.0.0 reply on the cable, 2026-11-13
+LINK_QUERY = bytes([0, 0, 0, 0, 0, 0x89]).ljust(64, b"\x00")  # receiver-local link-state query (spec 2.3)
 CABLE, RECEIVER = op.GLORIOUS_WIRED, op.GLORIOUS_RECEIVER
 
 
@@ -56,10 +60,13 @@ def mouse(req: bytes, stamp, relayed=False) -> bytes:
 
 class Fake:
     """Feature-report I/O of a cable (the mouse answers at once) or of the receiver in front of it.
-    stall: {body[6]: (0xA4 from, reply at)} in seconds after the request; reply at None = the link never comes back."""
+    stall: {body[6]: (0xA4 from, reply at)} in seconds after the request; reply at None = the link never comes back.
+    A list of those applies to successive requests, the last one repeating. link(t): what the 0x89 query answers
+    (None: 0xA3, as for a command the receiver does not know)."""
 
-    def __init__(self, clock, receiver, stamp=(12, 16), stall=None, broken=False):
+    def __init__(self, clock, receiver, stamp=(12, 16), stall=None, broken=False, link=lambda t: True):
         self.clock, self.receiver, self.stamp, self.stall, self.broken = clock, receiver, stamp, stall or {}, broken
+        self.link = link
         self.sent, self.shown, self.buf, self.pending = [], [], bytes(64), None
 
     def set_feature(self, buf):
@@ -70,10 +77,13 @@ class Fake:
         self.sent.append(body)
         if not self.receiver:
             self.buf = mouse(body, self.stamp)
-        elif body[2] != 0x02:  # answered by the receiver itself: its own version (no stamp), else 0xA3 + echo
-            self.buf = bytes([0xA1 if body[4:6] == b"\x00\x81" else 0xA3]) + body[1:]
+        elif body[2] != 0x02:  # answered by the receiver itself: only the link query may be sent to it
+            assert body == LINK_QUERY, f"receiver-local command sent: {body[:8].hex()}"
+            link = b"\xA3" + body[1:7] if self.link is None else b"\xA1" + body[1:6] + bytes([bool(self.link(self.clock.t))])
+            self.buf, self.pending = link + body[7:], None
         else:
-            self.pending = body, self.clock.t, *self.stall.get(body[6], (None, 0.008))
+            s = self.stall.get(body[6], (None, 0.008))
+            self.pending = body, self.clock.t, *(s if isinstance(s, tuple) else s.pop(0) if len(s) > 1 else s[0])
 
     def get_feature(self):
         if self.pending:
@@ -228,7 +238,8 @@ class DeviceLayer(unittest.TestCase):
         self.node("hidraw3", RECEIVER)
         dev = op.find_device(None)
         self.assertTrue(dev.relay)
-        self.assertEqual(dev.io.sent[0][:6], bytes([0, 0, 0x02, 0x0A, 0x00, 0x81]))
+        self.assertEqual(dev.io.sent[0], LINK_QUERY)  # link check first (spec 2.3)
+        self.assertEqual(dev.io.sent[1][:6], bytes([0, 0, 0x02, 0x0A, 0x00, 0x81]))
 
     def test_receiver_never_sends_envelope_to_old_patch_or_stock(self):
         self.node("hidraw1", RECEIVER, stamp=(16,))  # older patch build: bytes 12..15 not stamped
@@ -236,7 +247,7 @@ class DeviceLayer(unittest.TestCase):
         self.node("hidraw3", CABLE, stamp=(16,))
         for path in ("/dev/hidraw1", "/dev/hidraw2"):
             self.exits(lambda: op.find_device(path), "no DP01 stamp through the receiver")
-            self.assertEqual(len(self.opened[-1].sent), 1)  # only the version query
+            self.assertEqual([p[:6] for p in self.opened[-1].sent], [LINK_QUERY[:6], bytes([0, 0, 2, 0x0A, 0, 0x81])])
         self.assertFalse(op.find_device("/dev/hidraw3").relay)  # the older build is fine on the cable
 
     def test_transient_a4_then_reply(self):
@@ -249,7 +260,53 @@ class DeviceLayer(unittest.TestCase):
     def test_final_a4_is_unreachable(self):
         self.node("hidraw3", RECEIVER, stall={op.GET_PROFILE: (0.27, None)})
         dev = op.find_device(None)
+        before = len(dev.io.sent)
         self.exits(lambda: dev.command(op.GET_PROFILE), "cannot reach the mouse")
+        sent = dev.io.sent[before:]
+        self.assertEqual([p == LINK_QUERY for p in sent], [True, False, True, False])  # sent twice, link check first
+        self.assertEqual(sent[3][4], sent[1][4] + 1)  # new seq, and so a new CRC
+
+    def test_final_a4_waits_for_the_link_then_sends_again(self):
+        # The receiver clears its link flag before a final 0xA4 (disassembly 0xDA86 / 0xDAB0), so 0x89 answers 00
+        # until the mouse links again: here from 2 s (the first final 0xA4) to 3 s
+        self.node("hidraw3", RECEIVER, stall={op.GET_PROFILE: [(0.27, None), (None, 0.008)]},
+                  link=lambda t: not 2.0 <= t < 3.0)
+        dev = op.find_device(None)
+        before, err = len(dev.io.sent), io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(dev.command(op.GET_PROFILE)[:4], bytes(4))
+        self.assertEqual(err.getvalue(), op.WAIT_MSG + "\n")  # shown once
+        self.assertGreaterEqual(self.clock.t, 3.0)
+        sent = dev.io.sent[before:]
+        waited = len(sent) - 3
+        self.assertGreater(waited, 1)  # link queries until the link is back, then the resend
+        self.assertEqual([p == LINK_QUERY for p in sent], [True, False] + [True] * waited + [False])
+        self.assertEqual([(p[4], p[6]) for p in (sent[1], sent[-1])],
+                         [(sent[1][4], op.GET_PROFILE), (sent[1][4] + 1, op.GET_PROFILE)])  # new seq
+
+    def test_waits_for_the_link(self):
+        self.node("hidraw3", RECEIVER, link=lambda t: t >= 1.0)  # no link for the first second
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            dev = op.find_device(None)
+            dev.command(op.GET_CAPS)
+        self.assertEqual(err.getvalue(), op.WAIT_MSG + "\n")  # shown once
+        self.assertGreaterEqual(self.clock.t, 1.0)
+        self.assertGreater(sum(p == LINK_QUERY for p in dev.io.sent), 10)  # every ~0.1 s until the link is up
+        self.assertEqual(dev.io.sent[-2], LINK_QUERY)  # and once more before GET_CAPS
+
+    def test_unknown_link_state_sends_the_request(self):
+        self.node("hidraw3", RECEIVER, link=None)  # no 0x89 answer within 2 s: unknown, taken as linked
+        dev = op.find_device(None)
+        self.assertEqual(dev.command(op.GET_CAPS)[:4], b"DP01")
+        self.assertGreaterEqual(self.clock.t, 4.0)
+
+    def test_no_link_sends_no_request(self):
+        self.node("hidraw3", RECEIVER, link=lambda t: False)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.exits(lambda: op.find_device(None), "/dev/hidraw3: The receiver cannot reach the mouse")
+        self.assertGreaterEqual(self.clock.t, op.LINK_WAIT_S)
+        self.assertTrue(all(p == LINK_QUERY for p in self.opened[0].sent))  # not even the version query
 
     def test_cable_wins_over_receiver(self):
         self.node("hidraw2", RECEIVER)

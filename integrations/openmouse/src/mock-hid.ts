@@ -339,9 +339,17 @@ const radioBytes = (len: number): number => Math.min(64, Math.ceil(len / 8) * 8)
  *   reply (the request's length, not the reply's; the rest is stale).
  * - SAVE_FLASH erases a flash page, which stalls the mouse's radio: transient 0xA4,
  *   reply after ~770 ms. With `mouseOn = false` the 0xA4 never clears.
- * Requests it does not relay run the receiver's own handlers (version, link state,
- * RF ID, and the dangerous mode 0x00 / RF ID write 0x0A); this mock only counts
- * them in `localPackets` and answers 0xA3 with an echo.
+ * - The link-state query 0x89 ([4] = 0x00, [5] = 0x89) answers 0xA1 with [6] = 0x01,
+ *   counted in `linkQueries`; [6] = 0x00 (no link, inferred from the receiver's
+ *   disassembly) for the next `linkDownQueries` queries. With `mouseOn = false` each
+ *   relayed request sets `linkDownQueries` to 2: the receiver clears its link flag on link
+ *   loss before it answers 0xA4 (disassembly 0xDA86 / 0xDAB0). A real receiver would
+ *   answer 0x00 until the mouse links again; the link coming back after 2 queries, and
+ *   0x01 before the first relayed request, are test shortcuts so the off case ends after
+ *   two sends. The link state during the retail 0xA4 failures was not read.
+ * Requests it does not relay run the receiver's own handlers (version, RF ID, and the
+ * dangerous mode 0x00 / RF ID write 0x0A); this mock only counts any other one in
+ * `localPackets` and answers 0xA3 with an echo.
  */
 export class MockGloriousReceiverHidDevice implements WebHidFeatureTransport {
   public vendorId = GLORIOUS_VID;
@@ -350,6 +358,10 @@ export class MockGloriousReceiverHidDevice implements WebHidFeatureTransport {
   /** Off, asleep or out of range: relayed requests end in a lasting 0xA4 */
   public mouseOn = true;
   public localPackets = 0;
+  public linkQueries = 0;
+  public linkDownQueries = 0;
+  /** Requests with [2] = 0x02, forwarded to the mouse or not */
+  public relayedPackets = 0;
   public readonly mouse: MockGloriousSeriesOneProHidDevice;
 
   private buf = new Uint8Array(DDPI_HID_PACKET_LENGTH); // what GET_REPORT returns
@@ -366,16 +378,27 @@ export class MockGloriousReceiverHidDevice implements WebHidFeatureTransport {
     this.buf = new Uint8Array(DDPI_HID_PACKET_LENGTH);
     this.buf.set(req.subarray(0, DDPI_HID_PACKET_LENGTH));
     if (req[2] !== 0x02) {
+      this.pending = undefined;
+      if (req[4] === 0x00 && req[5] === 0x89) {
+        this.linkQueries++;
+        this.buf[0] = DDPI_STATUS_OK;
+        this.buf[6] = this.linkDownQueries > 0 ? 0x00 : 0x01;
+        this.linkDownQueries = Math.max(0, this.linkDownQueries - 1);
+        return;
+      }
       this.localPackets++;
       this.buf[0] = DDPI_STATUS_ERR_UNSUPPORTED;
-      this.pending = undefined;
       return;
     }
+    this.relayedPackets++;
     const len = Math.min(DDPI_HID_PACKET_LENGTH, req[3]! + 6);
     this.buf[0] = 0xa0;
     const saveFlash = req[1] === 0x50 && req[5] === DDPI_HID_NAMESPACE && req[6] === DdpiHidOpcode.SAVE_FLASH;
     this.pending = { at: Date.now(), replyMs: !this.mouseOn ? Infinity : saveFlash ? 770 : 8, len };
-    if (!this.mouseOn) return;
+    if (!this.mouseOn) {
+      this.linkDownQueries = 2; // link loss, see above
+      return;
+    }
     this.toMouse.set(req.subarray(0, radioBytes(len)));
     this.toMouse[0] = 0xa0;
     await this.mouse.sendFeatureReport(reportId, this.toMouse);

@@ -201,6 +201,8 @@
     // gets nothing unless its product name contains "[OpenDDPIv1]".
     const GLORIOUS_VID = 0x258a, GLORIOUS_CABLE = 0x2018, GLORIOUS_RECEIVER = 0x2031;
     const OP = { GET_CAPABILITIES: 0x01, SET_PROFILE: 0x03, SAVE_FLASH: 0x04, SET_ENABLED: 0x06 };
+    const WAIT_FOR_MOUSE = "Waiting for the mouse: move it or click a button (the receiver has no link to it).";
+    const UNREACHABLE = "The receiver cannot reach the mouse (switched off, asleep or out of range). Move or click it and try again, or use the cable.";
     const HID_FILTERS = [ // the 64-byte vendor Feature report is on usage page 0xFFFF
       { vendorId: GLORIOUS_VID, productId: GLORIOUS_CABLE, usagePage: 0xffff },
       { vendorId: GLORIOUS_VID, productId: GLORIOUS_RECEIVER, usagePage: 0xffff },
@@ -249,7 +251,7 @@
     }
 
     // GET_REPORT until ok(reply), for up to 2 s: a save through the receiver answers after ~770 ms,
-    // with a transient 0xA4 first. Only a final 0xA4 means the receiver cannot reach the mouse.
+    // with a transient 0xA4 first. Only a final 0xA4 means the receiver cannot reach the mouse: "a4".
     async function poll(dev, relay, ok) {
       let r = new Uint8Array(0);
       for (const end = performance.now() + 2000; performance.now() < end; ) {
@@ -259,35 +261,72 @@
         if (r.length === 65 && r[0] === 0) r = r.subarray(1); // some platforms return the report ID
         if (ok(r)) return r;
       }
-      if (relay && r[0] === 0xa4) throw new Error("The receiver cannot reach the mouse (switched off, asleep or out of range).");
-      return null;
+      return relay && r[0] === 0xa4 ? "a4" : null;
+    }
+
+    // The receiver's own link-state query 0x89 (spec/hid-protocol-v1.md §2.3 "Link state and retries"):
+    // body[6] = 0x01 is linked. No answer within 2 s is unknown and counts as linked. Without a link:
+    // onWait() once, the query every 100 ms, and after 15 s the request is not sent.
+    async function waitForLink(c) {
+      const linked = async () => {
+        const query = new Uint8Array(64);
+        query[5] = 0x89;
+        await c.dev.sendFeatureReport(0, query);
+        const r = await poll(c.dev, false, (r) => r[0] === 0xa1 && r[5] === 0x89);
+        return !r || r[6] === 0x01;
+      };
+      if (await linked()) return;
+      if (c.onWait) c.onWait();
+      for (const end = performance.now() + 15000; performance.now() < end; ) {
+        await new Promise((done) => setTimeout(done, 100));
+        if (await linked()) return;
+      }
+      throw new Error(UNREACHABLE);
+    }
+
+    // send() sends one request and returns its answer check. Through the receiver: the link check first,
+    // and after a final 0xA4 the check and send() once more (a new seq). Every opcode this page sends
+    // may be sent twice (no SIMULATE_DELTA, no ENTER_BOOTLOADER).
+    async function exchange(c, send) {
+      for (let resend = true; ; resend = false) {
+        if (c.relay) await waitForLink(c);
+        const r = await poll(c.dev, c.relay, await send());
+        if (r !== "a4") return r;
+        if (!resend) throw new Error(UNREACHABLE);
+      }
     }
 
     // Sequence numbers stay in 5..255: stock Glorious firmware rejects body[4] >= 5 before any handler.
     async function ddpiCommand(c, opcode, payload = []) {
-      const seq = c.seq;
-      c.seq = seq >= 255 ? 5 : seq + 1;
-      await c.dev.sendFeatureReport(0, ddpiPacket(seq, opcode, payload, c.relay));
-      const r = await poll(c.dev, c.relay, (r) => r.length >= 64 && r[0] === 0x44 && r[1] === 0x50 && r[4] === seq
-        && r[5] === 0xdf && r[6] === opcode && crc16(r.subarray(0, 62)) === (r[62] | (r[63] << 8)));
+      const r = await exchange(c, async () => {
+        const seq = c.seq;
+        c.seq = seq >= 255 ? 5 : seq + 1;
+        await c.dev.sendFeatureReport(0, ddpiPacket(seq, opcode, payload, c.relay));
+        return (r) => r.length >= 64 && r[0] === 0x44 && r[1] === 0x50 && r[4] === seq
+          && r[5] === 0xdf && r[6] === opcode && crc16(r.subarray(0, 62)) === (r[62] | (r[63] << 8));
+      });
       if (!r) throw new Error(`No answer to opcode 0x${opcode.toString(16)}.`);
       if (r[3] !== 0xa1) throw new Error(`Opcode 0x${opcode.toString(16)} failed: status 0x${r[3].toString(16)}.`);
       return r;
     }
 
-    // Resolves to a client { dev, relay, seq } once the device has identified itself, else rejects.
-    async function detectMouse(dev, seq = 5 + Math.floor(Math.random() * 251)) {
+    // Resolves to a client { dev, relay, seq, onWait } once the device has identified itself, else rejects.
+    // onWait() runs when the receiver has no link to the mouse (the page shows WAIT_FOR_MOUSE).
+    async function detectMouse(dev, seq = 5 + Math.floor(Math.random() * 251), onWait) {
       const glorious = dev.vendorId === GLORIOUS_VID && (dev.productId === GLORIOUS_CABLE || dev.productId === GLORIOUS_RECEIVER);
       const relay = glorious && dev.productId === GLORIOUS_RECEIVER;
+      const c = { dev, relay, seq, onWait };
       if (glorious) {
         // The patch stamps "DP01" at 12..15 and 16..19. Through the receiver only 12..15 counts: it copies
         // back body[3] + 6 bytes, so the relayed query asks for 16 (body[3] = 0x0A).
         const query = new Uint8Array(64);
         query.set(relay ? [0, 0, 0x02, 0x0a, 0x00, 0x81] : [0, 0, 0x00, 0x06, 0x00, 0x81]);
-        await dev.sendFeatureReport(0, query);
         // Only the finished version answer counts: a pending or stale frame can still hold an old stamp.
         const stamped = (r) => ascii4(r, 12) === "DP01" || (!relay && ascii4(r, 16) === "DP01");
-        const r = await poll(dev, relay, (r) => r[0] === 0xa1 && r[5] === 0x81);
+        const r = await exchange(c, async () => {
+          await dev.sendFeatureReport(0, query);
+          return (r) => r[0] === 0xa1 && r[5] === 0x81;
+        });
         if (!r || !stamped(r)) {
           throw new Error(`No DP01 stamp${relay ? " through the receiver" : ""}: the mouse runs stock firmware`
             + `${relay ? " or a patch build without 2.4 GHz support" : ""}. Flash the patch (adapters/glorious-cm2856).`);
@@ -295,7 +334,6 @@
       } else if (!dev.productName.includes("[OpenDDPIv1]")) {
         throw new Error(`${dev.productName || "This device"} is not a supported mouse: nothing was sent.`);
       }
-      const c = { dev, relay, seq };
       const caps = await ddpiCommand(c, OP.GET_CAPABILITIES);
       if (ascii4(caps, 8) !== "DP01") throw new Error("Unexpected GET_CAPABILITIES answer.");
       return c;
@@ -526,7 +564,7 @@
       sent = false;
       const dev = await requestMouse();
       if (!dev) return "No device picked.";
-      mouse = await detectMouse(dev);
+      mouse = await detectMouse(dev, undefined, () => mouseUi(WAIT_FOR_MOUSE));
       return `${dev.productName}: open-directional-dpi firmware found (${mouse.relay ? "2.4 GHz receiver" : "cable"}).`;
     });
     onMouseClick("bypassBtn", async () => {

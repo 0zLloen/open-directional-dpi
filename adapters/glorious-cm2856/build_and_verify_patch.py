@@ -10,15 +10,17 @@ Build and verify the open-directional-dpi patch for the Glorious Series One Pro
 2. Compiles stock_ddpi_patch.c + core/directional_dpi.c at 0x0001CD00 with
    $CROSS{gcc,objcopy,nm,objdump} (CROSS defaults to arm-none-eabi-, as in the Makefile).
 3. Appends the patch to the stock image, redirects the 4 call sites (0x0000E874, 0x0000E8CE,
-   0x000131D8, 0x00013278) and replaces the two 2.4 GHz reply-length reads (0x00015D8C,
-   0x00015DB4) with the 64-byte clamp.
+   0x000131D8, 0x00013278), replaces the two 2.4 GHz reply-length reads (0x00015D8C,
+   0x00015DB4) with the 64-byte clamp and the sensor DPI writer instruction at 0x00017864
+   with a call that records the DPI.
 4. Runs the compx_hex_tool.py safety audit (mouse-firmware-re) on the image.
-5. Runs the patched image in Unicorn (pip install unicorn; required) with 10 tests:
+5. Runs the patched image in Unicorn (pip install unicorn; required) with 11 tests:
    1-2 boot hook (recovery chord, normal boot), 3 stock version query + "DP01" stamp,
    4 stock bootloader entry (feat[3]=0x01, feat[6]=0xB0), 5 GET_CAPABILITIES,
    6 SET_PROFILE + SAVE_FLASH (an identical second save does not erase), 7 sensor hooks,
    8 request relayed through the 2.4 GHz receiver, 9 2.4 GHz reply capped at 64 bytes,
-   10 idle reset of the direction estimator after 50 burst calls (1 per ms tick).
+   10 idle reset of the direction estimator after 50 burst calls (1 per ms tick),
+   11 DPI-shift press and release: sensor_dpi follows the sensor, 0x20003068 does not.
 6. Only then writes adapters/build/CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.bin and .hex, and
    adapters/build/OpenDDPIv1-patch.json for apply_patch.py (users without the ARM toolchain). The
    patch file holds only the bytes that differ from the stock image: the hook instructions and the
@@ -208,6 +210,8 @@ def build_patch(stock_bin: bytes) -> dict:
         (0x00015D8C, "f17800f10802891d", lambda a: encode_thumb2_bl(a, clamp) + bytes.fromhex("00f10802"), "rf_len_clamp_1"),
         # ldrb r1,[r6,#3]; adds r1,#6  ->  bl clamp
         (0x00015DB4, "f178891d", lambda a: encode_thumb2_bl(a, clamp), "rf_len_clamp_2"),
+        # sub.w r0,r0,#0x2700 -> bl note (does the sub)
+        (0x00017864, "a0f51c50", lambda a: encode_thumb2_bl(a, symbols["ddpi_cpi_write_note"]), "cpi_write_note"),
     ]
     for addr, expected_hex, new_bytes, label in code_patches:
         file_off = addr - APP_BASE
@@ -297,6 +301,7 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
         "sim_motion": 0,
         "sim_dx": 0,
         "sim_dy": 0,
+        "spi": [],
     }
 
     def hook_code(uc, address, size, user_data):
@@ -337,6 +342,13 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
             uc.reg_write(UC_ARM_REG_R0, 0)
             lr = uc.reg_read(UC_ARM_REG_LR)
             uc.reg_write(UC_ARM_REG_PC, lr)
+        elif address == 0x000184B4:
+            # Stock PAW3370 register write (r0 = register, r1 = value): record it and return
+            sim_state["spi"].append((uc.reg_read(UC_ARM_REG_R0) & 0xFF, uc.reg_read(UC_ARM_REG_R1) & 0xFF))
+            uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
+        elif address == 0x000120B4:
+            # Stock delay: return at once
+            uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
 
     mu.hook_add(UC_HOOK_CODE, hook_code)
 
@@ -594,12 +606,17 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
         out = burst(0x80, 0, -8)
         assert out == (0, expected_dy), f"{idle_calls} idle calls: North -8 -> {out}, expected (0, {expected_dy})"
 
-    def caps_clock() -> int:
+    def caps() -> bytes:
         mu.mem_write(0x20004F28, make_ddpi_req(0x01))
         mu.mem_write(0x200032D4, b"\x01")
         call_bl_site_at(0x0000E8CE)
         r = bytes(mu.mem_read(0x20006000, 64))
-        assert r[3] == 0xA1 and r[15] & 0x80, "GET_CAPABILITIES must report the clock (flag bit 7)"
+        assert r[3] == 0xA1, "GET_CAPABILITIES failed"
+        return r
+
+    def caps_clock() -> int:
+        r = caps()
+        assert r[15] & 0x80, "GET_CAPABILITIES must report the clock (flag bit 7)"
         return struct.unpack_from("<I", r, 28)[0]
 
     c0 = caps_clock()
@@ -608,7 +625,37 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
     assert caps_clock() - c0 == 25, "the reported clock must count burst calls"
     print("  [PASS] Test 10: Idle reset after 50 burst calls (North -8 -> -4 after 49 idle calls; -8 after 48, still East; GET_CAPABILITIES clock = burst calls)")
 
-    print("[UNICORN] All 10 instruction-level Cortex-M4F hardware emulation tests PASSED!")
+    # -------------------------------------------------------------------------
+    # TEST 11: DPI shift held: the sensor DPI writer hook at 0x00017864 records it
+    # -------------------------------------------------------------------------
+    # Factory config (flash 0x1A3B8) in RAM, active DPI 1200, button 3 (layer 0) = DPI shift to 400.
+    # The real stock button path 0x14244 -> 0xA450 -> 0x17860 programs the sensor; 0x20003068 stays 1200.
+    mu.mem_write(0x20003003, b"\x02")  # wired mode
+    cfg = bytes(mu.mem_read(0x0001A3B8, 0x266))
+    mu.mem_write(0x200038C8, cfg)
+    mu.mem_write(0x20004CE4, cfg[0x2F : 0x2F + 27])
+    mu.mem_write(0x20004B30, cfg[0x5C:0xD4])
+    mu.mem_write(0x20003068, struct.pack("<H", 1200))
+    mu.mem_write(0x20004B30 + 15 * 3 + 1, bytes.fromhex("07010501900190"))
+    prof_body = struct.pack("<HBBHH8HH", 0x4450, 1, 0x81, 1200, 256, *octants, 0)  # ENABLED | ONLY_AT_BASE_DPI
+    mu.mem_write(0x20004F28, make_ddpi_req(0x03, prof_body + struct.pack("<H", crc16_ccitt(prof_body))))
+    mu.mem_write(0x200032D4, b"\x01")
+    call_bl_site_at(0x0000E8CE)
+    assert mu.mem_read(0x20006000, 4)[3] == 0xA1, "SET_PROFILE (ONLY_AT_BASE_DPI, 1200) failed"
+
+    for pressed, dpi_reg, dpi, expected in ((1, 0x07, 400, (0, -100)), (0, 0x17, 1200, (0, -50))):
+        sim_state["spi"] = []
+        mu.reg_write(UC_ARM_REG_R0, pressed)
+        mu.reg_write(UC_ARM_REG_R1, 3)
+        call_thumb_at(0x00014244)
+        assert sim_state["spi"] == [(0x4D, 0x50), (0x4E, dpi_reg), (0x56, 0x04), (0x5A, 0x10)], sim_state["spi"]
+        assert struct.unpack("<H", mu.mem_read(0x20003068, 2))[0] == 1200, "DPI shift must not change 0x20003068"
+        out = burst(0x80, 0, -100)  # before caps(): the burst wrapper must pick up the new DPI by itself
+        assert out == expected, f"pressed={pressed}: North -100 -> {out}, expected {expected}"
+        assert struct.unpack_from("<H", caps(), 26)[0] == dpi, "GET_CAPABILITIES sensor_dpi"
+    print("  [PASS] Test 11: DPI shift via stock 0x14244 (press: sensor 400, curve off; release: 1200, North -100 -> -50; 0x20003068 stays 1200)")
+
+    print("[UNICORN] All 11 instruction-level Cortex-M4F hardware emulation tests PASSED!")
 
 
 def main() -> None:

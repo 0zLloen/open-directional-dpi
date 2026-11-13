@@ -38,10 +38,6 @@ void *memset(void *dst, int c, size_t n) {
 #define STOCK_SENSOR_STATE_MOTION    (*(volatile uint8_t  *)0x20003020u)
 #define STOCK_SENSOR_STATE_DX        (*(volatile int16_t  *)0x2000302Eu)
 #define STOCK_SENSOR_STATE_DY        (*(volatile int16_t  *)0x20003030u)
-/* Active DPI (X) in DPI units, kept by every stock DPI path (button, host HID over USB and
- * 2.4 GHz, boot, profile switch) before it programs the sensor at 0x17860. A held DPI-shift
- * key programs the sensor without updating it. */
-#define STOCK_ACTIVE_DPI_X           (*(volatile uint16_t *)0x20003068u)
 
 #define STOCK_USB_FEAT_FLAG          (*(volatile uint8_t  *)0x200032D4u)
 #define STOCK_USB_GETFEAT_PTR        (*(uint8_t * volatile *)0x200032D8u)
@@ -67,6 +63,7 @@ typedef struct {
     uint32_t      init_magic;
     ddpi_engine_t engine;
     uint32_t      burst_calls; /* Clock for the idle reset (ddpi_paw3370_burst_wrapper) */
+    uint16_t      sensor_dpi;  /* DPI last written to the sensor (hook 4); outside the engine, so ddpi_engine_init keeps it */
 } ddpi_sram_state_t;
 
 /* Engine state must never reach the Compx bootloader magic word at 0x2003FFFC */
@@ -170,7 +167,7 @@ void ddpi_usb_protocol_wrapper(void) {
     if (feat[1] == 0x50u && feat[5] == DDPI_HID_NAMESPACE) {
         ddpi_ensure_initialized();
         ddpi_sram_state_t *st = get_ddpi_state();
-        ddpi_engine_set_sensor_dpi(&st->engine, STOCK_ACTIVE_DPI_X);
+        ddpi_engine_set_sensor_dpi(&st->engine, st->sensor_dpi);
         ddpi_engine_set_clock_ms(&st->engine, st->burst_calls); /* lets a host measure the idle-reset clock */
 
         uint8_t req_copy[DDPI_HID_PACKET_LEN];
@@ -226,8 +223,8 @@ void ddpi_paw3370_burst_wrapper(void) {
      * per tick at 0x131D8 while the sensor's motion pin is low. So a gap without motion
      * counts 1 call per ms. A stalled main loop merges ticks, which only delays the reset.
      * Measured on the cable (21ea252, 2026-11-13): 1000.0 calls/s with the mouse still.
-     * Over 2.4 GHz not measured (the receiver answers 0xA4 while the mouse sends no reports);
-     * inferred the same, from the same TIMER1 tick. */
+     * Over 2.4 GHz not measured; inferred the same: TIMER1 runs in every awake radio state and
+     * stops only on the way into System OFF (stock disassembly and emulation, 2026-11-13). */
     ddpi_sram_state_t *st = get_ddpi_state();
     st->burst_calls++;
 
@@ -239,12 +236,25 @@ void ddpi_paw3370_burst_wrapper(void) {
         int16_t out_dx = raw_dx;
         int16_t out_dy = raw_dy;
 
-        ddpi_engine_set_sensor_dpi(&st->engine, STOCK_ACTIVE_DPI_X); /* single-DPI-stage profiles */
+        ddpi_engine_set_sensor_dpi(&st->engine, st->sensor_dpi); /* single-DPI-stage profiles */
         ddpi_process_motion(&st->engine, raw_dx, raw_dy, st->burst_calls, &out_dx, &out_dy);
 
         STOCK_SENSOR_STATE_DX = out_dx;
         STOCK_SENSOR_STATE_DY = out_dy;
     }
+}
+
+/* Hook 4: bl at 0x00017864 in the stock sensor DPI writer 0x17860 (after push {r4, lr}; mov r4, r0).
+ * Every DPI path calls it (DPI button, DPI shift press 0xA74A / release 0xA752, DPI-adjust wheel,
+ * host DPI commands, profile switch, sensor init and re-init 0x19584); no RAM variable holds the DPI
+ * while DPI shift is held. r0 = DPI X; r1..r3, r12 are dead here and the next subs sets the flags.
+ * Only a u16 store: the main-loop wrappers hand it to the engine.
+ * ponytail: requested DPI, not effective; stock DPI 0 (wheel adjust) runs the sensor at 12800 but
+ * reads as 0 = unknown. Store ((((dpi / step) - 1) & 0xFF) + 1) * step if that ever matters. */
+__attribute__((used, section(".text.entry_cpi_note")))
+uint32_t ddpi_cpi_write_note(uint32_t dpi) {
+    get_ddpi_state()->sensor_dpi = (uint16_t)dpi;
+    return dpi - 0x2700u; /* the replaced instruction: sub.w r0, r0, #0x2700 */
 }
 
 /*
