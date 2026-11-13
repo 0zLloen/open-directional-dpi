@@ -1,0 +1,15 @@
+common:
+  platform_allow:
+    - native_sim
+    - native_sim/native/64
+  integration_platforms:
+    - native_sim/native/64
+  tags: input
+tests:
+  odd.input_filter.thread:
+    extra_configs:
+      - CONFIG_INPUT_MODE_THREAD=y
+  odd.input_filter.sync_no_settings:
+    extra_configs:
+      - CONFIG_INPUT_MODE_SYNCHRONOUS=y
+      - CONFIG_SETTINGS=n

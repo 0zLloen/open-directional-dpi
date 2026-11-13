@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: MIT
+
+description: |
+  Open Directional DPI input filter (per-direction mouse sensitivity).
+
+  Listens to the relative motion of the `input` device (mouse sensor,
+  trackball, ZMK split input, ...) and re-emits every REL_X/REL_Y frame from
+  this node with the 8-direction curve applied. All other events (buttons,
+  wheel, abs) are forwarded unchanged. Bind your HID layer / zmk,input-listener
+  to this node instead of the sensor.
+
+  The curve is in the frame of the events the sensor reports: if the sensor is
+  mounted rotated, fix the orientation in the sensor driver, not after this node.
+
+  The properties below are the boot defaults; a profile saved over HID
+  (SAVE_FLASH, needs CONFIG_SETTINGS) replaces them.
+
+compatible: "odd,directional-dpi"
+
+properties:
+  input:
+    type: phandle
+    required: true
+    description: Input device whose motion is filtered.
+
+  base-dpi:
+    type: int
+    default: 800
+    description: Sensor CPI recorded in the profile (the filter does not change it).
+
+  global-gain-q8-8:
+    type: int
+    default: 256
+    description: Global gain in Q8.8 (256 = 1.00x, 16..1024).
+
+  multipliers-q8-8:
+    type: array
+    default: [256, 256, 256, 256, 256, 256, 256, 256]
+    description: |
+      Per-direction multipliers in Q8.8 (256 = 1.00x, 16..1024), clockwise in
+      HID coordinates where +Y points toward the user:
+      <E SE S SW W NW N NE>. Any value other than 256 (here or in
+      global-gain-q8-8) enables the profile at boot.
+
+  window-counts:
+    type: int
+    default: 16
+    description: |
+      Travel-window length of the direction estimator in sensor counts
+      (0 = per-report direction, max 128).
+
+  idle-ms:
+    type: int
+    default: 50
+    description: |
+      Motion gap after which the direction estimator restarts, in 5 ms steps
+      (5..1275).
+
+  merge-axis-syncs:
+    type: boolean
+    description: |
+      For sources that put a sync on REL_X and another on REL_Y of the same
+      report, such as wch,ch9350l (USB HID mouse bridge, Zephyr 4.4+). A sync on
+      REL_X then no longer ends the frame; the next REL_Y, or any other event
+      with sync, does. Without it each such report is filtered as two
+      axis-aligned moves and the diagonal gains are lost. Do not set it for a
+      source that can report REL_X without a REL_Y after it.

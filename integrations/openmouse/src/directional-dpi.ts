@@ -34,6 +34,8 @@ export const DDPI_FLAG_RESET_REMAINDER_ON_REVERSE = 1 << 5;
 export const DDPI_FLAG_BYPASS_FOR_CALIBRATION = 1 << 6;
 export const DDPI_DEFAULT_WINDOW_COUNTS = 16;
 export const DDPI_MAX_WINDOW_COUNTS = 128;
+export const DDPI_DPI_MIN = 50;
+export const DDPI_DPI_MAX = 65535;
 
 export const DDPI_STATUS_OK = 0xa1;
 export const DDPI_STATUS_ERR_CRC_OR_FMT = 0xa2;
@@ -97,12 +99,26 @@ export interface DdpiProfileV1 {
   crc16: number;
 }
 
+/**
+ * Shareable profile JSON. `directionalMultipliers` always names physical HID
+ * directions (E = right, S = toward the user, N = away) whatever `frame` the
+ * firmware profile stores its array in. Fields added after the first release
+ * (frame .. idleResetMs) are optional on import and default to the old behaviour.
+ */
 export interface DdpiProfileJsonExport {
   schema: "open-directional-dpi-v1";
   version: 1;
   enabled: boolean;
   keepRemainderOnReverse: boolean;
   linearOctantRatio: boolean;
+  resetRemainderOnReverse: boolean;
+  /** Order of the 28-byte profile's multiplier array (DDPI_FLAG_FRAME_SENSOR_CCW) */
+  frame: "hid-cw" | "odd-sensor-ccw";
+  model: "angular-gain" | "linear-2x2";
+  /** Travel-window length L in counts (0 = instantaneous) */
+  windowCounts: number;
+  /** Idle gap that resets the direction estimator, multiple of 5; 0 = firmware default (50 ms) */
+  idleResetMs: number;
   baseDpi: number;
   globalGain: number;
   directionalMultipliers: {
@@ -118,7 +134,8 @@ export interface DdpiProfileJsonExport {
 }
 
 export interface DdpiDeviceCapabilities {
-  firmwareKind: "stock-glorious" | "open-directional-dpi-v1";
+  /** "unsupported": not a Glorious Series One Pro and no "[OpenDDPIv1]" product string */
+  firmwareKind: "stock-glorious" | "unsupported" | "open-directional-dpi-v1";
   protocolVersion: number;
   maxSlots: number;
   activeSlot: number;
@@ -174,7 +191,7 @@ export function clampQ8_8(val: number): number {
 }
 
 export function clampDpi(dpi: number): number {
-  return Math.max(50, Math.min(19000, Math.round(dpi)));
+  return Math.max(DDPI_DPI_MIN, Math.min(DDPI_DPI_MAX, Math.round(dpi)));
 }
 
 export function createDefaultProfileV1(baseDpi = 800): DdpiProfileV1 {
@@ -203,7 +220,10 @@ export function createDefaultProfileV1(baseDpi = 800): DdpiProfileV1 {
 }
 
 export function isProfileIdentity(profile: DdpiProfileV1): boolean {
-  if ((profile.flags & DDPI_FLAG_ENABLED) === 0) {
+  if (
+    (profile.flags & DDPI_FLAG_ENABLED) === 0 ||
+    (profile.flags & DDPI_FLAG_BYPASS_FOR_CALIBRATION) !== 0
+  ) {
     return true;
   }
   if (profile.globalGainQ8_8 !== DDPI_Q8_8_ONE) {
@@ -266,8 +286,7 @@ export function deserializeProfileV1(buf: Uint8Array): DdpiProfileV1 {
   const baseDpi = dv.getUint16(4, true);
   const globalGainQ8_8 = dv.getUint16(6, true);
   if (
-    baseDpi < 50 ||
-    baseDpi > 19000 ||
+    baseDpi < DDPI_DPI_MIN ||
     globalGainQ8_8 < DDPI_Q8_8_MIN ||
     globalGainQ8_8 > DDPI_Q8_8_MAX
   ) {
@@ -296,7 +315,16 @@ export function deserializeProfileV1(buf: Uint8Array): DdpiProfileV1 {
 }
 
 /**
- * Reference TypeScript implementation of ddpi_compute_scale_q16_16() matching C engine bit-for-bit.
+ * Index into profile.multipliersQ8_8 for a HID clockwise direction (DdpiDirection),
+ * honouring DDPI_FLAG_FRAME_SENSOR_CCW. Mirrors get_sector_multiplier_q8_8() in C.
+ */
+export function multiplierIndexForDirection(flags: number, hidCwIdx: number): number {
+  return (flags & DDPI_FLAG_FRAME_SENSOR_CCW) !== 0 ? (8 - hidCwIdx) & 7 : hidCwIdx & 7;
+}
+
+/**
+ * Reference TypeScript implementation of ddpi_compute_scale_q16_16(), checked
+ * bit-for-bit against the C engine by tests/vectors/scale_vectors.json.
  */
 export function computeDirectionalScaleQ16_16(
   profile: DdpiProfileV1,
@@ -381,13 +409,14 @@ export function computeDirectionalScaleQ16_16(
     r < 65536
   ) {
     const corr = Number(
-      (17907n * BigInt(r) * BigInt(65536 - r)) >> 32n
+      (22787n * BigInt(r) * BigInt(65536 - r)) >> 32n
     );
     t = Math.min(65536, r + corr);
   }
 
-  const mCardQ16 = profile.multipliersQ8_8[cardIdx]! << 8;
-  const mDiagQ16 = profile.multipliersQ8_8[diagIdx]! << 8;
+  const m = profile.multipliersQ8_8;
+  const mCardQ16 = m[multiplierIndexForDirection(profile.flags, cardIdx)]! << 8;
+  const mDiagQ16 = m[multiplierIndexForDirection(profile.flags, diagIdx)]! << 8;
   const diffQ16 = mDiagQ16 - mCardQ16;
   const mDirQ16 =
     mCardQ16 + Number((BigInt(diffQ16) * BigInt(t)) >> 16n);
@@ -398,73 +427,144 @@ export function computeDirectionalScaleQ16_16(
   return { scaleQ16_16, octant };
 }
 
+/** directionalMultipliers keys in HID clockwise order (index = DdpiDirection) */
+const JSON_DIRECTION_KEYS = [
+  "E_0",
+  "SE_45",
+  "S_90",
+  "SW_135",
+  "W_180",
+  "NW_225",
+  "N_270",
+  "NE_315",
+] as const;
+const JSON_FRAMES = ["hid-cw", "odd-sensor-ccw"] as const;
+const JSON_MODELS = ["angular-gain", "linear-2x2"] as const;
+
 /**
  * Export a DdpiProfileV1 to human-readable JSON for OpenMouse profile sharing.
+ * DDPI_FLAG_BYPASS_FOR_CALIBRATION is transient and not exported.
  */
 export function exportProfileJson(profile: DdpiProfileV1): string {
-  const m = profile.multipliersQ8_8;
+  const has = (bit: number): boolean => (profile.flags & bit) !== 0;
+  const directionalMultipliers = Object.fromEntries(
+    JSON_DIRECTION_KEYS.map((key, dir) => [
+      key,
+      q8_8ToFloat(
+        profile.multipliersQ8_8[multiplierIndexForDirection(profile.flags, dir)]!
+      ),
+    ])
+  ) as DdpiProfileJsonExport["directionalMultipliers"];
   const doc: DdpiProfileJsonExport = {
     schema: "open-directional-dpi-v1",
     version: 1,
-    enabled: (profile.flags & DDPI_FLAG_ENABLED) !== 0,
-    keepRemainderOnReverse:
-      (profile.flags & DDPI_FLAG_KEEP_REMAINDER_ON_REVERSE) !== 0,
-    linearOctantRatio: (profile.flags & DDPI_FLAG_LINEAR_OCTANT_RATIO) !== 0,
+    enabled: has(DDPI_FLAG_ENABLED),
+    keepRemainderOnReverse: has(DDPI_FLAG_KEEP_REMAINDER_ON_REVERSE),
+    linearOctantRatio: has(DDPI_FLAG_LINEAR_OCTANT_RATIO),
+    resetRemainderOnReverse: has(DDPI_FLAG_RESET_REMAINDER_ON_REVERSE),
+    frame: has(DDPI_FLAG_FRAME_SENSOR_CCW) ? "odd-sensor-ccw" : "hid-cw",
+    model: has(DDPI_FLAG_MODEL_LINEAR_2X2) ? "linear-2x2" : "angular-gain",
+    windowCounts: Math.min(DDPI_MAX_WINDOW_COUNTS, profile.reserved & 0xff),
+    idleResetMs: ((profile.reserved >> 8) & 0xff) * 5,
     baseDpi: profile.baseDpi,
     globalGain: q8_8ToFloat(profile.globalGainQ8_8),
-    directionalMultipliers: {
-      E_0: q8_8ToFloat(m[0]),
-      SE_45: q8_8ToFloat(m[1]),
-      S_90: q8_8ToFloat(m[2]),
-      SW_135: q8_8ToFloat(m[3]),
-      W_180: q8_8ToFloat(m[4]),
-      NW_225: q8_8ToFloat(m[5]),
-      N_270: q8_8ToFloat(m[6]),
-      NE_315: q8_8ToFloat(m[7]),
-    },
+    directionalMultipliers,
   };
   return JSON.stringify(doc, null, 2);
 }
 
 /**
  * Import and validate an OpenMouse Directional DPI JSON profile string.
+ * Throws a descriptive Error for anything that is not a valid profile.
+ * Unknown fields are ignored; fields missing from older files take their old defaults.
  */
 export function importProfileJson(jsonStr: string): DdpiProfileV1 {
-  const parsed = JSON.parse(jsonStr) as DdpiProfileJsonExport;
-  if (parsed.schema !== "open-directional-dpi-v1" || parsed.version !== 1) {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonStr);
+  } catch (err) {
+    throw new Error(`Profile is not valid JSON: ${(err as Error).message}`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("Profile JSON must be an object");
+  }
+  const doc = parsed as Record<string, unknown>;
+  if (doc.schema !== "open-directional-dpi-v1" || doc.version !== 1) {
     throw new Error("Invalid Open Directional DPI JSON schema or version");
   }
-  let flags = 0;
-  if (parsed.enabled) flags |= DDPI_FLAG_ENABLED;
-  if (parsed.keepRemainderOnReverse) flags |= DDPI_FLAG_KEEP_REMAINDER_ON_REVERSE;
-  if (parsed.linearOctantRatio) flags |= DDPI_FLAG_LINEAR_OCTANT_RATIO;
 
-  const dm = parsed.directionalMultipliers;
+  const bool = (key: string): boolean => {
+    const v = doc[key] ?? false;
+    if (typeof v !== "boolean") throw new Error(`"${key}" must be true or false`);
+    return v;
+  };
+  const int = (key: string, min: number, max: number, fallback?: number): number => {
+    const v = doc[key] ?? fallback;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) {
+      throw new Error(`"${key}" must be an integer in ${min}..${max}`);
+    }
+    return v;
+  };
+  const oneOf = (key: string, allowed: readonly string[]): string => {
+    const v = doc[key] ?? allowed[0];
+    if (typeof v !== "string" || !allowed.includes(v)) {
+      throw new Error(`"${key}" must be one of: ${allowed.join(", ")}`);
+    }
+    return v;
+  };
+  const q8_8 = (v: unknown, what: string): number => {
+    const q = typeof v === "number" ? Math.round(v * DDPI_Q8_8_ONE) : NaN;
+    if (!(q >= DDPI_Q8_8_MIN && q <= DDPI_Q8_8_MAX)) {
+      throw new Error(
+        `${what} must be a number in ${DDPI_Q8_8_MIN / DDPI_Q8_8_ONE}..${DDPI_Q8_8_MAX / DDPI_Q8_8_ONE}`
+      );
+    }
+    return q;
+  };
+
+  const flags =
+    (bool("enabled") ? DDPI_FLAG_ENABLED : 0) |
+    (bool("keepRemainderOnReverse") ? DDPI_FLAG_KEEP_REMAINDER_ON_REVERSE : 0) |
+    (bool("linearOctantRatio") ? DDPI_FLAG_LINEAR_OCTANT_RATIO : 0) |
+    (bool("resetRemainderOnReverse") ? DDPI_FLAG_RESET_REMAINDER_ON_REVERSE : 0) |
+    (oneOf("frame", JSON_FRAMES) === "odd-sensor-ccw" ? DDPI_FLAG_FRAME_SENSOR_CCW : 0) |
+    (oneOf("model", JSON_MODELS) === "linear-2x2" ? DDPI_FLAG_MODEL_LINEAR_2X2 : 0);
+
+  const windowCounts = int("windowCounts", 0, DDPI_MAX_WINDOW_COUNTS, 0);
+  const idleResetMs = int("idleResetMs", 0, 255 * 5, 0);
+  if (idleResetMs % 5 !== 0) {
+    throw new Error(`"idleResetMs" must be a multiple of 5`);
+  }
+
+  const dm = doc.directionalMultipliers;
+  if (typeof dm !== "object" || dm === null || Array.isArray(dm)) {
+    throw new Error(`"directionalMultipliers" must be an object`);
+  }
+  const multipliersQ8_8: EightMultipliers = [0, 0, 0, 0, 0, 0, 0, 0];
+  JSON_DIRECTION_KEYS.forEach((key, dir) => {
+    multipliersQ8_8[multiplierIndexForDirection(flags, dir)] = q8_8(
+      (dm as Record<string, unknown>)[key],
+      `"directionalMultipliers.${key}"`
+    );
+  });
+
   const profile: DdpiProfileV1 = {
     magic: DDPI_PROFILE_MAGIC,
     version: DDPI_PROFILE_VERSION,
     flags,
-    baseDpi: clampDpi(parsed.baseDpi),
-    globalGainQ8_8: floatToQ8_8(parsed.globalGain),
-    multipliersQ8_8: [
-      floatToQ8_8(dm.E_0),
-      floatToQ8_8(dm.SE_45),
-      floatToQ8_8(dm.S_90),
-      floatToQ8_8(dm.SW_135),
-      floatToQ8_8(dm.W_180),
-      floatToQ8_8(dm.NW_225),
-      floatToQ8_8(dm.N_270),
-      floatToQ8_8(dm.NE_315),
-    ],
-    reserved: 0,
+    baseDpi: int("baseDpi", DDPI_DPI_MIN, DDPI_DPI_MAX),
+    globalGainQ8_8: q8_8(doc.globalGain, `"globalGain"`),
+    multipliersQ8_8,
+    reserved: ((idleResetMs / 5) << 8) | windowCounts,
     crc16: 0,
   };
-  const raw = serializeProfileV1(profile);
-  return deserializeProfileV1(raw);
+  return deserializeProfileV1(serializeProfileV1(profile));
 }
 
 /**
  * Generate a 360-point polar sensitivity curve (1-degree steps) for OpenMouse UI rendering.
+ * For the linear-2x2 model the multiplier is |out| / |in| of the C engine's matrix
+ * (that model also bends the direction, which the curve does not show).
  */
 export function computePolarCurve360(
   profile: DdpiProfileV1
@@ -474,12 +574,23 @@ export function computePolarCurve360(
     effectiveDpi: number;
     multiplier: number;
   }> = [];
+  /* ddpi_process_delta's 2x2 path: gx = M[E]·G, gy = M[N]·G, h = trunc((M[NE]·G - M[NW]·G) / 2) */
+  const gain = (dir: number): number =>
+    profile.multipliersQ8_8[multiplierIndexForDirection(profile.flags, dir)]! *
+    profile.globalGainQ8_8;
+  const linear2x2 =
+    (profile.flags & DDPI_FLAG_MODEL_LINEAR_2X2) !== 0 && !isProfileIdentity(profile);
+  const gx = gain(DdpiDirection.E);
+  const gy = gain(DdpiDirection.N);
+  const h = Math.trunc((gain(DdpiDirection.NE) - gain(DdpiDirection.NW)) / 2);
   for (let deg = 0; deg < 360; deg++) {
     const rad = (deg * Math.PI) / 180;
     const dx = Math.round(1000 * Math.cos(rad));
     const dy = Math.round(1000 * Math.sin(rad));
-    const { scaleQ16_16 } = computeDirectionalScaleQ16_16(profile, dx, dy);
-    const mult = scaleQ16_16 / DDPI_Q16_16_ONE;
+    const mult = linear2x2
+      ? Math.hypot(dx * gx - dy * h, dy * gy - dx * h) /
+        (DDPI_Q16_16_ONE * Math.hypot(dx, dy))
+      : computeDirectionalScaleQ16_16(profile, dx, dy).scaleQ16_16 / DDPI_Q16_16_ONE;
     points.push({
       angleDeg: deg,
       effectiveDpi: Math.round(profile.baseDpi * mult),
@@ -488,6 +599,10 @@ export function computePolarCurve360(
   }
   return points;
 }
+
+/* GET_REPORT retries while a device is still processing a request (~300 ms) */
+const ANSWER_POLLS = 30;
+const ANSWER_POLL_MS = 10;
 
 /**
  * OpenMouse WebHID Protocol Client for Open Directional DPI v1.
@@ -503,31 +618,38 @@ export class OpenMouseDirectionalDpiClient {
   }
 
   /**
-   * Detect whether the connected Glorious Series One Pro is running stock Compx
-   * firmware or custom Open Directional DPI v1 firmware.
+   * Detect whether the device speaks Open Directional DPI v1 (spec/hid-protocol-v1.md §2.2).
    *
-   * Safety Rule: Performs passive USB descriptor inspection first (productName / bcdDevice).
-   * If passive inspection shows unmodified stock firmware, returns "stock-glorious"
-   * immediately WITHOUT sending any custom vendor HID packets.
+   * Safety Rule: no Open Directional DPI packet goes to a device that has not
+   * identified itself first: product string "[OpenDDPIv1]" (any device), or for
+   * the Glorious Series One Pro IDs only, bcdDevice >= 0x0201 or the "DP01" stamp
+   * the stock-firmware patch adds to the stock firmware-version answer.
+   * Otherwise returns "stock-glorious" / "unsupported".
    */
   async detectCapabilities(): Promise<DdpiDeviceCapabilities> {
-    const isCustomDescriptor =
-      this.transport.productName.includes("[OpenDDPIv1]") ||
-      (this.transport.bcdDevice !== undefined &&
-        this.transport.bcdDevice >= 0x0201);
+    const t = this.transport;
+    const glorious =
+      t.vendorId === GLORIOUS_VID &&
+      (t.productId === SERIES_ONE_PRO_WIRED_PID ||
+        t.productId === SERIES_ONE_PRO_WIRELESS_PID);
+    const speaksOdd =
+      t.productName.includes("[OpenDDPIv1]") ||
+      (glorious &&
+        ((t.bcdDevice !== undefined && t.bcdDevice >= 0x0201) ||
+          (await this.gloriousVersionHasPatchStamp())));
 
-    if (!isCustomDescriptor) {
+    if (!speaksOdd) {
       return {
-        firmwareKind: "stock-glorious",
+        firmwareKind: glorious ? "stock-glorious" : "unsupported",
         protocolVersion: 0,
         maxSlots: 0,
         activeSlot: 0,
-        wired1000Hz: true,
+        wired1000Hz: glorious,
         nvsStorage: false,
-        paw3370Sensor: true,
-        bootloaderReentry: true,
-        minDpi: 50,
-        maxDpi: 19000,
+        paw3370Sensor: glorious,
+        bootloaderReentry: glorious,
+        minDpi: glorious ? 50 : 0,
+        maxDpi: glorious ? 19000 : 0,
         minMultiplierQ8_8: DDPI_Q8_8_ONE,
         maxMultiplierQ8_8: DDPI_Q8_8_ONE,
       };
@@ -586,6 +708,16 @@ export class OpenMouseDirectionalDpiClient {
     return (resp[8]! & DDPI_FLAG_ENABLED) !== 0;
   }
 
+  /**
+   * Exact 1.00x passthrough while calibrating (SET_ENABLED mode 2): a calibration
+   * measured through the active curve would be relative to it. Returns the
+   * ENABLED flag, which is kept; pass it to setEnabled() to end the bypass.
+   */
+  async bypassForCalibration(slot = 0): Promise<boolean> {
+    const resp = await this.sendCommand(DdpiHidOpcode.SET_ENABLED, slot, new Uint8Array([2]));
+    return (resp[8]! & DDPI_FLAG_ENABLED) !== 0;
+  }
+
   async saveToFlash(slot = 0): Promise<DdpiProfileV1> {
     const resp = await this.sendCommand(
       DdpiHidOpcode.SAVE_FLASH,
@@ -639,13 +771,15 @@ export class OpenMouseDirectionalDpiClient {
       DDPI_BOOTLOADER_CONFIRM_MAGIC,
       true
     );
-    await this.sendCommand(DdpiHidOpcode.ENTER_BOOTLOADER, 0, payload);
+    /* The device normally resets without answering: only an error status fails */
+    await this.sendCommand(DdpiHidOpcode.ENTER_BOOTLOADER, 0, payload, true);
   }
 
   private async sendCommand(
     opcode: DdpiHidOpcode,
     slot: number,
-    payload: Uint8Array
+    payload: Uint8Array,
+    mayNotAnswer = false
   ): Promise<Uint8Array> {
     const pkt = new Uint8Array(DDPI_HID_PACKET_LENGTH);
     const seq = this.seq & 0xff;
@@ -666,14 +800,25 @@ export class OpenMouseDirectionalDpiClient {
     pkt[63] = (reqCrc >> 8) & 0xff;
 
     await this.transport.sendFeatureReport(0x00, pkt);
-    const dv = await this.transport.receiveFeatureReport(0x00);
-    const raw = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
-    /* Strip leading Report ID 0x00 if WebHID/HIDAPI returned 65 bytes */
-    const resp =
-      raw.length === 65 && raw[0] === 0x00 ? raw.subarray(1, 65) : raw;
-
-    if (resp.length !== DDPI_HID_PACKET_LENGTH) {
-      throw new Error(`Invalid Feature report response length: ${resp.length}`);
+    /* Only the answer echoing this seq and opcode counts; until it is ready the
+     * device may still return its previous answer */
+    const resp = await this.pollAnswer(
+      (r) =>
+        r.length === DDPI_HID_PACKET_LENGTH &&
+        r[0] === 0x44 &&
+        r[1] === 0x50 &&
+        r[4] === seq &&
+        r[5] === DDPI_HID_NAMESPACE &&
+        r[6] === opcode
+    ).catch((err: unknown) => {
+      if (!mayNotAnswer) throw err;
+      return undefined; // e.g. the device left the bus while resetting
+    });
+    if (resp === undefined) {
+      if (mayNotAnswer) return new Uint8Array(0);
+      throw new Error(
+        `No answer to opcode 0x${opcode.toString(16)} within ${ANSWER_POLLS * ANSWER_POLL_MS} ms`
+      );
     }
     const expCrc = crc16Ccitt(resp, 62);
     const actCrc = resp[62]! | (resp[63]! << 8);
@@ -686,5 +831,45 @@ export class OpenMouseDirectionalDpiClient {
       );
     }
     return resp;
+  }
+
+  /**
+   * GET_REPORT(Feature 0), without a leading Report ID, until `isAnswer` accepts
+   * it; undefined if it never does. The Glorious patch answers from the main loop
+   * (via the 2.4 GHz receiver: after a radio round trip, and SAVE_FLASH erases a
+   * flash page first), so the first GET_REPORT can return the previous answer.
+   */
+  private async pollAnswer(
+    isAnswer: (resp: Uint8Array) => boolean
+  ): Promise<Uint8Array | undefined> {
+    for (let i = 0; i <= ANSWER_POLLS; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, ANSWER_POLL_MS));
+      const dv = await this.transport.receiveFeatureReport(0x00);
+      const raw = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+      /* Strip leading Report ID 0x00 if WebHID/HIDAPI returned 65 bytes */
+      const resp = raw.length === 65 && raw[0] === 0x00 ? raw.subarray(1, 65) : raw;
+      if (isAnswer(resp)) return resp;
+    }
+    return undefined;
+  }
+
+  /**
+   * Stock Glorious firmware-version query, in the layout stock_ddpi_patch.c
+   * matches ([3] = 0x06, [4] = 0x00, [5] = 0x81). Stock firmware just answers it;
+   * the patch also writes "DP01" into [16..19] of the answer.
+   */
+  private async gloriousVersionHasPatchStamp(): Promise<boolean> {
+    const req = new Uint8Array(DDPI_HID_PACKET_LENGTH);
+    req[3] = 0x06;
+    req[5] = 0x81;
+    await this.transport.sendFeatureReport(0x00, req);
+    const stamped = (r: Uint8Array): boolean =>
+      String.fromCharCode(...r.subarray(16, 20)) === "DP01";
+    /* Stops at the stamp or at a finished answer echoing the query; stock
+     * firmware that does not echo it costs the whole poll budget */
+    const resp = await this.pollAnswer(
+      (r) => stamped(r) || (r[0] === 0xa1 && r[4] === 0x00 && r[5] === 0x81)
+    );
+    return resp !== undefined && stamped(resp);
   }
 }

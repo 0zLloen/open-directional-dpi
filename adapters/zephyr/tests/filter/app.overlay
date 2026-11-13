@@ -1,0 +1,35 @@
+/ {
+	src0: odd-src0 {
+		compatible = "vnd,input-device";
+	};
+
+	src1: odd-src1 {
+		compatible = "vnd,input-device";
+	};
+
+	src2: odd-src2 {
+		compatible = "vnd,input-device";
+	};
+
+	/* All defaults: flat curve, exact passthrough */
+	filter0: odd-filter0 {
+		compatible = "odd,directional-dpi";
+		input = <&src0>;
+	};
+
+	filter1: odd-filter1 {
+		compatible = "odd,directional-dpi";
+		input = <&src1>;
+		base-dpi = <1600>;
+		multipliers-q8-8 = <512 256 128 256 384 256 200 256>;
+		window-counts = <8>;
+		idle-ms = <100>;
+	};
+
+	/* Source with a sync on X and on Y of each report (wch,ch9350l) */
+	filter2: odd-filter2 {
+		compatible = "odd,directional-dpi";
+		input = <&src2>;
+		merge-axis-syncs;
+	};
+};
