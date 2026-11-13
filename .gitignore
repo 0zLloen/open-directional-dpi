@@ -5,6 +5,25 @@ PROGRESS.md
 adapters/stock/
 adapters/build/
 
+# Vendor updaters, archives and other firmware formats (CI fails if a tracked file matches this file)
+*.exe
+*.dll
+*.zip
+*.7z
+*.rar
+*.msi
+*.asar
+*.node
+*.uf2
+*.ihx
+*.srec
+*.s19
+*.mot
+*.dfu
+# Raw USB captures can contain keystrokes from other devices on the bus
+*.pcap
+*.pcapng
+
 # Build outputs
 build/
 twister-out*/
