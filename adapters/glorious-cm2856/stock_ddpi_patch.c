@@ -225,8 +225,9 @@ void ddpi_paw3370_burst_wrapper(void) {
      * but it calls the burst once per 1 ms TIMER1 tick at 0x13278, motion or not, plus once
      * per tick at 0x131D8 while the sensor's motion pin is low. So a gap without motion
      * counts 1 call per ms. A stalled main loop merges ticks, which only delays the reset.
-     * Inferred from the stock disassembly and Unicorn (2026-11-13), not measured on
-     * hardware; over 2.4 GHz the radio re-times the tick (about 1 ms, inferred). */
+     * Measured on the cable (21ea252, 2026-11-13): 1000.0 calls/s with the mouse still.
+     * Over 2.4 GHz not measured (the receiver answers 0xA4 while the mouse sends no reports);
+     * inferred the same, from the same TIMER1 tick. */
     ddpi_sram_state_t *st = get_ddpi_state();
     st->burst_calls++;
 
