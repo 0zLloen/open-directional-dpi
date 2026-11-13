@@ -8,13 +8,13 @@ No aim trainer exports that per flick (see [What the trainers export](#what-the-
 | :--- | :--- | :--- |
 | `mouse-log` | Mouse log | Aimlabs SpiderShot (the task Corsair PureVector calibrates with), or any task with static targets and one click per target |
 | `kovaaks` | Mouse log + the run's `Stats.csv` | KovaaK's static clicking scenarios (one click per kill, e.g. 1wall 6targets). Keeps only kill-to-kill flicks with no missed click in between |
-| `builtin` | Nothing to install | `providers/builtin/calibrate.html`, a center-out task in the browser that exports the profile itself |
+| `builtin` | Nothing to install | `providers/builtin/calibrate.html` (hosted at <https://0zlloen.github.io/open-directional-dpi/>), a center-out task in the browser that exports the profile itself. Local copy: `python3 -m http.server` in `providers/builtin`, then `http://localhost:8000/calibrate.html` |
 
 `mouse-log` and `kovaaks` have not been run on a real Aimlabs or KovaaK's session yet (2026-11-13). Their tests use made-up logs in the real file layouts.
 
 ## 1. Turn the current curve off
 
-The log sees motion after the mouse (or host filter) applied its curve, and the output is absolute, so calibrate with the curve off. Glorious: `python3 tools/odd_profile.py reset` (RAM only, without `--save`). Or **Turn curve off for calibration** in `calibrate.html` (Chrome or Edge; not yet tried on hardware). evdev: stop the filter.
+The log sees motion after the mouse (or host filter) applied its curve, and the output is absolute, so calibrate with the curve off. Glorious: `python3 tools/odd_profile.py reset` (RAM only, without `--save`). Or **Turn curve off for calibration** in [`calibrate.html`](https://0zlloen.github.io/open-directional-dpi/) (Chrome or Edge; not yet tried on hardware). evdev: stop the filter.
 
 ## 2. Record a mouse log while you play
 

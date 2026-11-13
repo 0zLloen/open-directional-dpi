@@ -78,7 +78,8 @@ What the board does:
 
 Hosts:
 - `integrations/openmouse` (WebHID, Chrome or Edge): open the device with the filter `QMK_RAW_HID_FILTER` (`{ usagePage: 0xff60, usage: 0x61 }`) and pass it to `OpenMouseDirectionalDpiClient`; `detectCapabilities()` sends the probe. Tested against a mock board only.
-- `calibrate.html` (**Send to mouse**) and `tools/odd_profile.py` do not speak raw HID yet: they use the Feature report only.
+- `tools/odd_profile.py` (Linux hidraw, or hidapi on any OS): finds the `0xFF60`/`0x61` interface and probes it only when no mouse is found or `--device` names it. Tested against fake boards only.
+- `calibrate.html` (**Send to mouse**) does not speak raw HID yet: it uses the Feature report only.
 - Close the VIA or Vial app while configuring: it reads replies from the same interface.
 
 ## Compile check without QMK

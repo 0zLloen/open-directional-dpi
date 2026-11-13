@@ -56,6 +56,7 @@
       border: none;
     }
     button:disabled { opacity: 0.45; cursor: default; }
+    a { color: var(--accent); }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -95,7 +96,7 @@
     <h1>Open Directional Sensitivity Calibration</h1>
     <p>Measures primary-submovement overshoot/undershoot across 8 counter-clockwise directions (<code>odd-sensor-ccw</code>) using raw Pointer Lock input.</p>
     <p style="color: var(--warn)"><strong>Turn the directional curve off first.</strong> The browser sees motion after the mouse or host filter has applied it, so a calibration through an active curve is relative to it and recalibrating undoes the last one. Glorious Series One Pro with the patch: <em>Turn curve off for calibration</em> below, or <code>python3 tools/odd_profile.py reset</code> (Linux, RAM only); other firmware with the HID protocol: <code>SET_ENABLED</code> mode 2 (<code>bypassForCalibration()</code> in <code>integrations/openmouse</code>); Linux: stop <code>odd_evdev_filter</code>; QMK and devicetree curves: flash a flat curve.</p>
-    <p>Send to mouse (WebHID: Chrome or Edge on Windows, macOS and Linux): a Glorious Series One Pro with the open-directional-dpi patch, by cable or through its 2.4 GHz receiver, or a device with <code>[OpenDDPIv1]</code> in its product name. Until it sees the patch's DP01 stamp, the page sends only the stock version query. A sent profile lasts until the mouse powers off; <em>Save on mouse</em> keeps it (each save erases a flash page, so save once at the end). If Connect does not work with the page opened as a file, serve it from localhost (<code>python3 -m http.server</code> in this folder). On Linux, Chrome needs write access to the mouse's <code>/dev/hidraw</code> node. Not yet tried on a real mouse (2026-11-13).</p>
+    <p>Send to mouse (WebHID: Chrome or Edge on Windows, macOS and Linux): a Glorious Series One Pro with the open-directional-dpi patch, by cable or through its 2.4 GHz receiver, or a device with <code>[OpenDDPIv1]</code> in its product name. Until it sees the patch's DP01 stamp, the page sends only the stock version query. A sent profile lasts until the mouse powers off; <em>Save on mouse</em> keeps it (each save erases a flash page, so save once at the end). Hosted copy: <a href="https://0zlloen.github.io/open-directional-dpi/">0zlloen.github.io/open-directional-dpi</a>. If Connect does not work with the page opened as a file, use the hosted copy or serve this folder (<code>python3 -m http.server</code>, then <code>http://localhost:8000/calibrate.html</code>). On Linux, Chrome needs write access to the mouse's <code>/dev/hidraw</code> node. Not yet tried on a real mouse (2026-11-13).</p>
     <div class="controls">
       <label>Base Sensor CPI <input type="number" id="baseCpi" value="800" min="50" max="65535" step="50" /></label>
       <label><input type="checkbox" id="onlyAtBaseDpi" /> Only at this DPI (one DPI stage, like Corsair PureVector)</label>
@@ -545,7 +546,7 @@
       return "Saved on the mouse.";
     });
     mouseUi(navigator.hid ? "Mouse: not connected."
-      : "Send to mouse needs WebHID: Chrome or Edge, with the page on localhost or https. Download the JSON instead.");
+      : "Send to mouse needs WebHID: Chrome or Edge, with the page on https (the hosted copy) or localhost. Download the JSON instead.");
 
     resize();
     updateTableAndJson();
