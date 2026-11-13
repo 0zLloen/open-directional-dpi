@@ -7,7 +7,8 @@
  *      "DP01" stamped into the stock firmware-version answer, and the Open
  *      Directional DPI v1 commands answered like ddpi_hid_handle_feature_report()
  *      with the patch's save and bootloader callbacks.
- * and the 2.4 GHz receiver (258a:2031) in front of either (MockGloriousReceiverHidDevice).
+ * and the 2.4 GHz receiver (258a:2031) in front of either (MockGloriousReceiverHidDevice),
+ * and a QMK keyboard's raw HID interface (MockQmkRawHidDevice).
  *
  * Never interacts with physical USB hardware; enables 100% offline testing.
  *
@@ -46,6 +47,7 @@ import {
   SERIES_ONE_PRO_WIRELESS_PID,
   serializeProfileV1,
   type WebHidFeatureTransport,
+  type WebHidRawTransport,
 } from "./directional-dpi.ts";
 
 /** clamp_rem_i32() in core/directional_dpi.c: 32767 counts in Q16.16 */
@@ -65,6 +67,10 @@ export class MockGloriousSeriesOneProHidDevice implements WebHidFeatureTransport
   /** Sensor DPI the mock firmware reports in GET_CAPABILITIES (0 = unknown) */
   public sensorDpi = 0;
   public clockMs: number | null = null;
+  /** on_enter_bootloader present (false: ENTER_BOOTLOADER answers 0xA3, as on QMK) */
+  public bootloaderCallback = true;
+  /** GET_CAPABILITIES magic; anything but "DP01" plays a foreign 0xDF handler (spec §6.3) */
+  public capsMagic = "DP01";
 
   /* One live profile (max_slots = 1, the slot byte is ignored) and its flash copy */
   private profile = createDefaultProfileV1(800);
@@ -153,8 +159,8 @@ export class MockGloriousSeriesOneProHidDevice implements WebHidFeatureTransport
 
     switch (opcode) {
       case DdpiHidOpcode.GET_CAPABILITIES: {
-        payload.set([0x44, 0x50, 0x30, 0x31, DDPI_PROFILE_VERSION, 1, 0], 0); // "DP01", v1, 1 slot, active 0
-        payload[7] = 0x3a; // nvs_storage | bootloader_reentry | travel_window | linear_2x2
+        payload.set([...new TextEncoder().encode(this.capsMagic), DDPI_PROFILE_VERSION, 1, 0], 0); // "DP01", v1, 1 slot, active 0
+        payload[7] = this.bootloaderCallback ? 0x3a : 0x32; // nvs_storage | bootloader_reentry | travel_window | linear_2x2
         dv.setUint16(8, DDPI_DPI_MIN, true);
         dv.setUint16(10, DDPI_DPI_MAX, true);
         dv.setUint16(12, DDPI_Q8_8_MIN, true);
@@ -235,7 +241,9 @@ export class MockGloriousSeriesOneProHidDevice implements WebHidFeatureTransport
       }
 
       case DdpiHidOpcode.ENTER_BOOTLOADER:
-        if (reqDv.getUint32(0, true) !== DDPI_BOOTLOADER_CONFIRM_MAGIC) {
+        if (!this.bootloaderCallback) {
+          resp[3] = DDPI_STATUS_ERR_UNSUPPORTED;
+        } else if (reqDv.getUint32(0, true) !== DDPI_BOOTLOADER_CONFIRM_MAGIC) {
           resp[3] = DDPI_STATUS_ERR_RANGE;
         } else {
           this.triggerCompxBootloaderReset();
@@ -390,5 +398,94 @@ export class MockGloriousReceiverHidDevice implements WebHidFeatureTransport {
       }
     }
     return new DataView(this.buf.slice().buffer);
+  }
+}
+
+type InputReportListener = (event: { data: DataView }) => void;
+
+/**
+ * Mock QMK keyboard raw HID interface (usage page 0xFF60, usage 0x61), as
+ * spec/hid-protocol-v1.md §6 reads QMK 0.34.8 and vial-qmk. `stack` is its firmware:
+ * - "ddpi": VIA or Vial with adapters/qmk: every 0xDF frame answered in place by
+ *   odd_qmk_raw_hid(); a complete request goes to `engine` (the patched-Glorious mock's
+ *   packet handler, standing in for ddpi_hid_handle_feature_report())
+ * - "via": VIA without the adapter: byte 0 set to 0xFF (id_unhandled), frame sent back
+ * - "vial-unlocking": Vial while an unlock runs: non-Vial frames sent back unchanged
+ * - "silent": raw HID without a handler: no reply
+ * With `viaAppOpen` a VIA app report (byte 0 = 0x01) arrives before each reply.
+ */
+export class MockQmkRawHidDevice implements WebHidRawTransport {
+  public vendorId = 0xfeed;
+  public productId = 0x0001;
+  public productName = "Corne";
+  public collections = [{ usagePage: 0xff60, usage: 0x61 }];
+  public framesReceived = 0;
+  public viaAppOpen = false;
+  public readonly engine = Object.assign(new MockGloriousSeriesOneProHidDevice("open-directional-dpi-v1"), {
+    bootloaderCallback: false, // the adapter passes NULL (§6.4)
+  });
+  public readonly stack: "ddpi" | "via" | "vial-unlocking" | "silent";
+
+  private req = new Uint8Array(DDPI_HID_PACKET_LENGTH);
+  private resp: Uint8Array = new Uint8Array(DDPI_HID_PACKET_LENGTH);
+  private next = 0;
+  private listeners = new Set<InputReportListener>();
+
+  constructor(stack: "ddpi" | "via" | "vial-unlocking" | "silent") {
+    this.stack = stack;
+  }
+
+  addEventListener(_type: "inputreport", listener: InputReportListener): void {
+    this.listeners.add(listener);
+  }
+
+  removeEventListener(_type: "inputreport", listener: InputReportListener): void {
+    this.listeners.delete(listener);
+  }
+
+  async sendReport(reportId: number, data: Uint8Array): Promise<void> {
+    if (reportId !== 0x00 || data.length !== 32) {
+      throw new Error(`Unexpected raw HID report: id ${reportId}, ${data.length} bytes`);
+    }
+    this.framesReceived++;
+    const f = data.slice();
+    if (this.stack === "silent") return;
+    if (this.stack === "via") f[0] = 0xff;
+    if (this.stack === "ddpi") await this.oddQmkRawHid(f);
+    /* A VIA app reply whose byte 1 happens to match: only byte 0 tells it apart */
+    const replies = this.viaAppOpen ? [Uint8Array.of(0x01, f[1]!), f] : [f];
+    setTimeout(() => {
+      for (const r of replies) {
+        const report = new Uint8Array(32);
+        report.set(r);
+        for (const l of [...this.listeners]) l({ data: new DataView(report.buffer) });
+      }
+    }, 0);
+  }
+
+  /** odd_qmk_raw_hid() in adapters/qmk/odd_pointing_device.c; other ids get VIA's 0xFF */
+  private async oddQmkRawHid(f: Uint8Array): Promise<void> {
+    if (f[0] !== DDPI_HID_NAMESPACE) {
+      f[0] = 0xff;
+      return;
+    }
+    const chunk = f[1]! & 0x7f;
+    const n = chunk === 2 ? 4 : 30;
+    const want = this.next;
+    this.next = 0;
+    if (chunk > 2) return;
+    if ((f[1]! & 0x80) !== 0) {
+      f.fill(0, 2);
+      f.set(this.resp.subarray(30 * chunk, 30 * chunk + n), 2);
+      return;
+    }
+    if (chunk !== 0 && chunk !== want) return;
+    this.req.set(f.subarray(2, 2 + n), 30 * chunk);
+    if (chunk < 2) {
+      this.next = chunk + 1;
+      return;
+    }
+    await this.engine.sendFeatureReport(0x00, this.req);
+    this.resp = new Uint8Array((await this.engine.receiveFeatureReport(0x00)).buffer);
   }
 }

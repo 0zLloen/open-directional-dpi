@@ -12,7 +12,7 @@ Corsair's PureVector does the same kind of thing (a static sensitivity per direc
 | :--- | :--- | :--- | :--- |
 | Stock-firmware binary patch | Glorious Series One Pro (Compx CM2856: nRF52840 + PAW3370), stock firmware `CM2856_Mouse_USB v1.00.00` | `adapters/glorious-cm2856/` | HID feature report over the cable or the 2.4 GHz receiver: `tools/odd_profile.py` (Linux) or **Send to mouse** in `calibrate.html` (WebHID); saved to flash |
 | Zephyr input filter | Any mouse or trackball on the Zephyr input subsystem; ZMK (including splits); Keychron ZGM once its source is released | `adapters/zephyr/`, `zephyr/module.yml` | Devicetree (`calibration/cli.ts ... --format dts`); HID feature report if the firmware routes it; Zephyr settings |
-| QMK `pointing_device` | QMK pointing devices (PMW33xx, PAW3222, ADNS, Cirque, ...) | `adapters/qmk/` | `keymap.c` (`calibration/cli.ts ... --format qmk`) |
+| QMK `pointing_device` | QMK pointing devices (PMW33xx, PAW3222, ADNS, Cirque, ...) | `adapters/qmk/` | `keymap.c` (`calibration/cli.ts ... --format qmk`); with raw HID (`RAW_ENABLE`, or VIA / Vial, which keep working) the HID protocol in 32-byte frames: the WebHID client in `integrations/openmouse`; saved to EEPROM with `EECONFIG_USER_DATA_SIZE` |
 | Linux host filter | Any relative mouse on Linux (evdev -> uinput) | `adapters/linux-evdev/` | Command line (`calibration/cli.ts ... --format evdev` prints the arguments) |
 
 Notes:
@@ -30,7 +30,7 @@ Notes:
   - Not yet tested on hardware: `calibrate.html` with the mouse in a real browser (**Send to mouse**, **Save on mouse**, **Turn curve off for calibration**), the idle-clock rate over 2.4 GHz (inferred, see above), and the ZMK board for this mouse in mouse-firmware-re (`devices/glorious-series-one-pro/zmk-board/`, never flashed), whose boot chord is separate code from the patch's.
 - Zephyr: setup, devicetree properties and the HID hook are in [`adapters/zephyr/README.md`](adapters/zephyr/README.md).
 - Linux evdev: the virtual mouse copies the source's bus/VID/PID, name and input properties, so libinput quirks and per-device desktop settings still apply. udev cannot give it the source's hwdb entry (`MOUSE_DPI`, which libinput's adaptive speed divides by), except for Bluetooth mice; when the source has one, the filter prints the udev rule that restores it.
-- QMK: without `MOUSE_EXTENDED_REPORT`, reports are 8-bit and gains above 1.00x lose counts; see [`adapters/qmk/README.md`](adapters/qmk/README.md).
+- QMK: without `MOUSE_EXTENDED_REPORT`, reports are 8-bit and gains above 1.00x lose counts; see [`adapters/qmk/README.md`](adapters/qmk/README.md). The raw HID route (spec §6) is inferred from the QMK 0.34.8 and vial-qmk sources and tested against a mock board; not yet built in QMK or run on a device (2026-11-13). `calibrate.html` and `tools/odd_profile.py` do not speak it yet.
 
 ---
 
@@ -64,12 +64,12 @@ open-directional-dpi/
 ├── adapters/
 │   ├── glorious-cm2856/             # Stock-firmware patch: stock_ddpi_patch.c/.ld (make check), build_and_verify_patch.py (.hex + 10 Unicorn tests; needs the stock image)
 │   ├── zephyr/                      # Zephyr / ZMK / Keychron ZGM input filter (`odd,directional-dpi`)
-│   ├── qmk/                         # QMK `pointing_device` adapter (`pointing_device_task_odd`)
+│   ├── qmk/                         # QMK `pointing_device` adapter (`pointing_device_task_odd`), raw HID protocol hook (`odd_raw_hid.c`)
 │   └── linux-evdev/                 # evdev -> uinput host filter for any mouse
 ├── integrations/
 │   └── openmouse/
 │       ├── src/directional-dpi.ts   # TypeScript codec, scale mirror, JSON import/export, WebHID client
-│       ├── src/mock-hid.ts          # Mock Glorious mouse (stock and patched firmware) and 2.4 GHz receiver for tests
+│       ├── src/mock-hid.ts          # Mock Glorious mouse (stock and patched firmware), 2.4 GHz receiver and QMK raw HID board for tests
 │       └── test/                    # C-vector parity, JSON and mock-HID tests
 ├── tools/
 │   ├── odd_profile.py               # Load / save / export profiles on a mouse (Linux hidraw, stdlib only)
@@ -103,7 +103,7 @@ open-directional-dpi/
    - Uses `requestPointerLock({ unadjustedMovement: true })` to measure primary-submovement overshoot/undershoot in 8 directions and exports an `open-directional-dpi-v1` JSON profile that `tools/odd_profile.py load` accepts. In Chrome or Edge, **Send to mouse** puts the result on a patched Glorious or an `[OpenDDPIv1]` device over WebHID (not yet tried on hardware).
    - Aim trainers (Aimlabs SpiderShot, KovaaK's): `calibration/cli.ts` makes the same JSON from a raw mouse log recorded while playing; see [`calibration/README.md`](calibration/README.md) for the steps and what each trainer exports. Not yet run on a real Aimlabs or KovaaK's session (2026-11-13); the tests use made-up logs.
    - `cli.ts format profile.json --format evdev|qmk|dts` turns a profile JSON into the evdev filter's arguments, `keymap.c` lines or devicetree properties.
-   - Calibrate with the curve off: the page sees motion after the mouse (or host filter) applied the active curve, and exports absolute gains, so a recalibration through an active curve undoes the previous one. Glorious: **Turn curve off for calibration** in `calibrate.html`, or `python3 tools/odd_profile.py reset` (RAM only). Other HID firmware: `SET_ENABLED` mode 2 (`bypassForCalibration()` in `integrations/openmouse`, exact 1.00x, end it with `setEnabled()`). evdev: stop the filter. QMK / devicetree curves: flash a flat curve first.
+   - Calibrate with the curve off: the page sees motion after the mouse (or host filter) applied the active curve, and exports absolute gains, so a recalibration through an active curve undoes the previous one. Glorious: **Turn curve off for calibration** in `calibrate.html`, or `python3 tools/odd_profile.py reset` (RAM only). Other HID firmware, including QMK with raw HID: `SET_ENABLED` mode 2 (`bypassForCalibration()` in `integrations/openmouse`, exact 1.00x, end it with `setEnabled()`). evdev: stop the filter. QMK without raw HID / devicetree curves: flash a flat curve first.
 5. **Conformance vectors (`tests/vectors/`):** 2592 scale/octant results from the C engine; the TypeScript mirror must match every one.
 6. **Single DPI stage (like Corsair PureVector):** a profile with `onlyAtBaseDpi` (flag bit 7) applies only while the sensor runs at its `baseDpi`; every other DPI stage passes through unchanged. It needs firmware that reports the current DPI: the Glorious patch (reads the stock firmware's active DPI) and QMK (`pointing_device_get_cpi()`). Elsewhere the flag has no effect and the curve applies at every DPI. In `calibrate.html`, tick "Only at this DPI" and enter that stage's DPI as the base CPI.
 
@@ -112,13 +112,13 @@ open-directional-dpi/
 ## Quick Start: Run All Checks
 
 ```bash
-# C engine: 17 unit tests
+# C engine: 17 unit tests, then the QMK raw HID transport (tests/test_qmk_raw_hid.c)
 make -C tests test
 
 # Conformance vectors: regenerate from the engine; the diff must be empty
 make -C tests vectors && git diff --exit-code -- tests/vectors
 
-# TypeScript (Node >= 22.6): 20 OpenMouse suites incl. C-vector and odd_profile.py parity and the 2.4 GHz receiver, then the calibration, CLI and calibrate.html WebHID tests
+# TypeScript (Node >= 22.6): 21 OpenMouse suites incl. C-vector and odd_profile.py parity, the 2.4 GHz receiver and QMK raw HID, then the calibration, CLI and calibrate.html WebHID tests
 node --experimental-strip-types --test integrations/openmouse/test/directional-dpi.test.ts
 node --experimental-strip-types --test calibration/tests/*.test.ts
 
@@ -131,9 +131,10 @@ python3 tools/test_odd_profile.py
 # Linux evdev filter: build and self-test (no root or /dev/uinput needed)
 make -C adapters/linux-evdev check
 
-# QMK adapter: standalone compile check (8-bit and extended reports)
+# QMK adapter: standalone compile check (8-bit and extended reports, raw HID)
 gcc -std=c11 -Wall -Wextra -Werror -pedantic -c adapters/qmk/odd_pointing_device.c -o /dev/null
 gcc -std=c11 -Wall -Wextra -Werror -pedantic -DMOUSE_EXTENDED_REPORT -c adapters/qmk/odd_pointing_device.c -o /dev/null
+gcc -std=c11 -Wall -Wextra -Werror -pedantic -DRAW_ENABLE -c adapters/qmk/odd_pointing_device.c -o /dev/null
 
 # Glorious stock patch: compile + link with arm-none-eabi-gcc (CROSS=/path/bin/arm-none-eabi- if not on PATH)
 make -C adapters/glorious-cm2856 check
