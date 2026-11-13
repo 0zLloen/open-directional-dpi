@@ -90,5 +90,8 @@ jobs:
         run: |
           node --experimental-strip-types --test calibration/tests/*.test.ts
 
-      - name: Run odd_profile.py device-layer tests (fake cable and receiver)
+      - name: Run odd_profile.py device-layer tests (fake cable, receiver, QMK raw HID, hidapi)
         run: python3 tools/test_odd_profile.py
+
+      - name: Run Glorious patch-file tests (synthetic image, no vendor bytes)
+        run: python3 adapters/glorious-cm2856/test_apply_patch.py
