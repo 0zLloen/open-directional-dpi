@@ -9,10 +9,16 @@ Load, save and export Open Directional DPI profiles on a mouse (Linux hidraw, st
   encode PROFILE.json      offline: print the 28-byte profile the JSON becomes (hex)
   decode HEX               offline: print the JSON for a 28-byte profile
 
-Devices: a Glorious Series One Pro running the open-directional-dpi patch (wired, 258a:2018; detected by
-the DP01 stamp in its firmware-version reply, nothing else is sent to stock firmware), or any device
-whose USB product string contains "[OpenDDPIv1]". Use --device /dev/hidrawN to pick one explicitly.
+Devices: a Glorious Series One Pro running the open-directional-dpi patch, by cable (258a:2018) or
+through its 2.4 GHz receiver (258a:2031), detected by the DP01 stamp in its firmware-version reply
+(nothing else is sent to stock firmware); or any device whose USB product string contains
+"[OpenDDPIv1]". The cable is used when both are connected; --device /dev/hidrawN picks one.
 Without --save, a loaded profile lasts until the mouse powers off.
+
+Through the receiver, requests carry the Compx relay envelope: body[2] = 0x02 (target: mouse) and
+body[3] = 0x3A (forward 64 bytes); the CRC still covers the canonical packet (body[2] = 1, body[3] = 0).
+Only patch builds that also stamp bytes 12..15 understand it, so older builds are never sent one.
+Sequence numbers are always >= 5: stock firmware rejects such a packet before running any handler.
 
 The JSON mapping mirrors integrations/openmouse/src/directional-dpi.ts (exportProfileJson /
 importProfileJson); integrations/openmouse/test checks both directions against it.
@@ -34,7 +40,7 @@ F_ENABLED, F_KEEP_REM, F_LINEAR, F_CCW, F_2X2, F_RESET_REM, F_BYPASS, F_ONLY_BAS
 KEYS = ["E_0", "SE_45", "S_90", "SW_135", "W_180", "NW_225", "N_270", "NE_315"]  # HID clockwise
 GET_CAPS, GET_PROFILE, SET_PROFILE, SAVE_FLASH, RESET_DEFAULTS = 0x01, 0x02, 0x03, 0x04, 0x05
 STATUS = {0xA1: "ok", 0xA2: "CRC or format error", 0xA3: "unsupported", 0xA4: "out of range"}
-GLORIOUS_WIRED = (0x258A, 0x2018)
+GLORIOUS_WIRED, GLORIOUS_RECEIVER = (0x258A, 0x2018), (0x258A, 0x2031)
 
 
 def crc16(data: bytes) -> int:
@@ -143,8 +149,8 @@ def _ioc(nr: int) -> int:
 
 
 class Device:
-    def __init__(self, path: str):
-        self.path, self.fd, self.seq = path, os.open(path, os.O_RDWR), int(time.time()) & 0xFF
+    def __init__(self, path: str, relay: bool = False):
+        self.path, self.relay, self.fd, self.seq = path, relay, os.open(path, os.O_RDWR), int(time.time()) % 251
 
     def set(self, body: bytes):
         fcntl.ioctl(self.fd, _ioc(0x06), bytearray(b"\x00" + body.ljust(64, b"\x00")))
@@ -155,53 +161,70 @@ class Device:
         return bytes(buf[1:])
 
     def has_dp01_stamp(self) -> bool:
-        """Stock Glorious firmware-version query; the open-directional-dpi patch adds 'DP01' at bytes 16..19."""
-        self.set(bytes([0, 0, 0, 0x06, 0x00, 0x81]))
-        for _ in range(10):
-            time.sleep(0.025)
+        """Stock Glorious firmware-version query. The patch stamps 'DP01' at bytes 16..19 and, since it can
+        relay over 2.4 GHz, also at 12..15 (only the first 16 bytes of this reply travel over the radio). The
+        receiver copies back request body[3] + 6 bytes, so the relayed query asks for 16 (body[3] = 0x0A)."""
+        self.set(bytes([0, 0, 0x02, 0x0A, 0x00, 0x81] if self.relay else [0, 0, 0x00, 0x06, 0x00, 0x81]))
+        r = self.poll(lambda r: r[0] == 0xA1 and r[5] == 0x81)
+        if r is None:
+            return False
+        return r[12:16] == b"DP01" or (not self.relay and r[16:20] == b"DP01")
+
+    def poll(self, ok, seconds: float = 2.0) -> bytes | None:
+        """GET_REPORT until ok(reply). Through the receiver, 0xA4 (link down) can be transient: SAVE_FLASH's
+        page erase stalls the mouse's radio, the receiver shows 0xA4 after ~270 ms and the real reply still
+        arrives (~770 ms on a retail mouse). So only a final 0xA4 counts as an unreachable mouse."""
+        deadline, r = time.monotonic() + seconds, b""
+        while time.monotonic() < deadline:
+            time.sleep(0.005)
             r = self.get()
-            if r[0] == 0xA1 and r[5] == 0x81:
-                return r[16:20] == b"DP01"
-        return False
+            if ok(r):
+                return r
+        if self.relay and r[:1] == b"\xA4":
+            sys.exit(f"{self.path}: the receiver cannot reach the mouse (switched off, asleep or out of range).")
+        return None
 
     def command(self, opcode: int, payload: bytes = b"") -> bytes:
-        self.seq = (self.seq + 1) & 0xFF
+        self.seq = 5 + (self.seq - 4) % 251  # 5..255: stock firmware never runs a handler for these
         req = bytearray(64)
         req[0:3], req[4], req[5], req[6] = b"DP\x01", self.seq, NAMESPACE, opcode
         req[8:8 + len(payload)] = payload
         struct.pack_into("<H", req, 62, crc16(req[:62]))
+        if self.relay:
+            req[2], req[3] = 0x02, 0x3A  # relay envelope, outside the CRC (see module docstring)
         self.set(bytes(req))
-        for _ in range(30):  # slow devices answer late; accept only our own answer
-            time.sleep(0.010)
-            r = self.get()
-            if r[0:2] == b"DP" and r[4] == self.seq and r[6] == opcode and struct.unpack_from("<H", r, 62)[0] == crc16(r[:62]):
-                if r[3] != 0xA1:
-                    raise RuntimeError(f"opcode 0x{opcode:02X} failed: {STATUS.get(r[3], hex(r[3]))}")
-                return r[8:]
-        raise RuntimeError(f"no answer to opcode 0x{opcode:02X}")
+        r = self.poll(lambda r: r[0:2] == b"DP" and r[4] == self.seq and r[6] == opcode  # only our own answer
+                      and struct.unpack_from("<H", r, 62)[0] == crc16(r[:62]))
+        if r is None:
+            raise RuntimeError(f"no answer to opcode 0x{opcode:02X}")
+        if r[3] != 0xA1:
+            raise RuntimeError(f"opcode 0x{opcode:02X} failed: {STATUS.get(r[3], hex(r[3]))}")
+        return r[8:]
 
 
 def find_device(explicit: str | None) -> Device:
-    if explicit:
-        return Device(explicit)
     found = []
     for h in sorted(Path("/sys/class/hidraw").glob("hidraw*")):
+        if explicit and h.name != Path(explicit).name:
+            continue
         uevent = dict(l.split("=", 1) for l in (h / "device/uevent").read_text().splitlines() if "=" in l)
         _bus, vid, pid = (int(x, 16) for x in uevent.get("HID_ID", "0:0:0").split(":"))
         rdesc = (h / "device/report_descriptor").read_bytes()
         vendor_page = len(rdesc) >= 3 and rdesc[0] == 0x06 and rdesc[2] == 0xFF  # usage page 0xFFxx
-        if vendor_page and ((vid, pid) == GLORIOUS_WIRED or "[OpenDDPIv1]" in uevent.get("HID_NAME", "")):
-            found.append((f"/dev/{h.name}", (vid, pid) == GLORIOUS_WIRED))
+        if explicit or (vendor_page and ((vid, pid) in (GLORIOUS_WIRED, GLORIOUS_RECEIVER) or "[OpenDDPIv1]" in uevent.get("HID_NAME", ""))):
+            found.append((f"/dev/{h.name}", (vid, pid)))
+    wired = [f for f in found if f[1] != GLORIOUS_RECEIVER]
     if not found:
-        sys.exit("No supported device found. Connect the mouse by cable (configuration over the 2.4 GHz receiver "
-                 "is not supported yet), check permissions on /dev/hidraw*, or pass --device.")
-    if len(found) > 1:
+        sys.exit("No supported device found. Connect the mouse by cable or plug in its receiver, check "
+                 "permissions on /dev/hidraw*, or pass --device.")
+    if len(wired) > 1 or (not wired and len(found) > 1):
         sys.exit("Several devices found, pick one with --device: " + ", ".join(p for p, _ in found))
-    path, glorious = found[0]
-    dev = Device(path)
-    if glorious and not dev.has_dp01_stamp():
-        sys.exit(f"{path}: Glorious Series One Pro on stock firmware (no DP01 stamp). Flash the "
-                 "open-directional-dpi patch first (adapters/glorious-cm2856).")
+    path, ids = (wired or found)[0]  # the cable wins over the receiver
+    dev = Device(path, relay=ids == GLORIOUS_RECEIVER)
+    if ids in (GLORIOUS_WIRED, GLORIOUS_RECEIVER) and not dev.has_dp01_stamp():
+        sys.exit(f"{path}: no DP01 stamp" + (" through the receiver" if dev.relay else "") + ": the mouse runs stock "
+                 "firmware" + (" or a patch build without 2.4 GHz support" if dev.relay else "") +
+                 ". Flash the current open-directional-dpi patch (adapters/glorious-cm2856).")
     return dev
 
 
@@ -234,7 +257,7 @@ def main() -> int:
     if a.cmd == "info":
         caps = dev.command(GET_CAPS)
         dpi_min, dpi_max, _, _, _, _, sensor_dpi = struct.unpack_from("<HHHHBBH", caps, 8)
-        print(f"device      : {dev.path} (protocol {caps[4]}, DPI {dpi_min}..{dpi_max})")
+        print(f"device      : {dev.path} ({'2.4 GHz receiver' if dev.relay else 'direct'}, protocol {caps[4]}, DPI {dpi_min}..{dpi_max})")
         print(f"current DPI : {sensor_dpi if sensor_dpi else 'not reported by this firmware'}")
         print(f"save to flash: {'yes' if caps[7] & 0x02 else 'no'}")
         print("profile     :", json.dumps(decode(dev.command(GET_PROFILE)), indent=2))

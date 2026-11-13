@@ -145,6 +145,27 @@ def build_patch() -> dict:
         full_bin[file_off : file_off + 4] = encoded
         print(f"        Patched {label:<20} @ 0x{call_addr:08X}: 0x{orig_target:08X} -> 0x{new_target:08X} ({encoded.hex()})")
 
+    # Cap the stock 2.4 GHz reply length at 64 bytes (see ddpi_rf_reply_len_clamp): replace the two
+    # "ldrb r1,[r6,#3]; adds r1,#6" length reads in 0x15D74 with a BL to the clamp helper.
+    clamp = symbols["ddpi_rf_reply_len_clamp"]
+    code_patches = [
+        # ldrb r1,[r6,#3]; add.w r2,r0,#8; adds r1,#6  ->  bl clamp; add.w r2,r0,#8
+        (0x00015D8C, "f17800f10802891d", lambda a: encode_thumb2_bl(a, clamp) + bytes.fromhex("00f10802"), "rf_len_clamp_1"),
+        # ldrb r1,[r6,#3]; adds r1,#6  ->  bl clamp
+        (0x00015DB4, "f178891d", lambda a: encode_thumb2_bl(a, clamp), "rf_len_clamp_2"),
+    ]
+    for addr, expected_hex, new_bytes, label in code_patches:
+        file_off = addr - APP_BASE
+        expected = bytes.fromhex(expected_hex)
+        assert bytes(full_bin[file_off : file_off + len(expected)]) == expected, (
+            f"Code patch {label} at 0x{addr:08X} expected {expected_hex}, got "
+            f"{bytes(full_bin[file_off : file_off + len(expected)]).hex()}"
+        )
+        replacement = new_bytes(addr)
+        assert len(replacement) == len(expected)
+        full_bin[file_off : file_off + len(expected)] = replacement
+        print(f"        Patched {label:<20} @ 0x{addr:08X}: {expected_hex} -> {replacement.hex()}")
+
     out_bin_path = BUILD_DIR / "CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.bin"
     out_hex_path = BUILD_DIR / "CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.hex"
     out_bin_path.write_bytes(full_bin)
@@ -313,7 +334,7 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
     call_bl_site_at(0x0000E8CE)
     usb_resp = bytes(mu.mem_read(0x20004F28, 64))
     usb_get_buf = bytes(mu.mem_read(0x20006000, 64))
-    assert usb_resp[0] == 0xA1 and usb_resp[6:12] == bytes([1, 0, 0, 0, 0x20, 0x18]) and usb_resp[16:20] == b"DP01", (
+    assert usb_resp[0] == 0xA1 and usb_resp[6:12] == bytes([1, 0, 0, 0, 0x20, 0x18]) and usb_resp[16:20] == b"DP01" and usb_resp[12:16] == b"DP01", (
         f"Unexpected usb_resp: {usb_resp[:24].hex()}"
     )
     assert usb_get_buf == usb_resp
@@ -425,7 +446,59 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
     assert out_dx == 100 and out_dy == 0, f"Expected (100, 0), got ({out_dx}, {out_dy})"
     print("  [PASS] Test 7: PAW3370 Motion Burst Hooks @ 0x000131D8 & 0x00013278 (East 100->100, North -100->-50)")
 
-    print("[UNICORN] All 7 instruction-level Cortex-M4F hardware emulation tests PASSED!")
+    # -------------------------------------------------------------------------
+    # TEST 8: Request relayed through the 2.4 GHz receiver (wireless mode)
+    # -------------------------------------------------------------------------
+    # Receiver envelope: feat[0] = 0xA0 (receiver "busy"), feat[2] = 0x02 (target: mouse),
+    # feat[3] = 0x3A (forward 64 bytes); the CRC covers the canonical packet.
+    RF_CTRL = 0x2000361C
+    mu.mem_write(0x20003003, b"\x01")  # wireless mode
+    mu.mem_write(0x200035DE, b"\x00")  # USB not configured
+    relayed = bytearray(make_ddpi_req(0x01))
+    relayed[0], relayed[2], relayed[3] = 0xA0, 0x02, 0x3A
+    mu.mem_write(0x20004F28, bytes(relayed))
+    mu.mem_write(0x200032D4, b"\x01")
+    mu.mem_write(RF_CTRL + 0x0F, b"\x00")
+    call_bl_site_at(0x0000E8CE)
+    rf_resp = bytes(mu.mem_read(0x20004F28, 64))
+    assert rf_resp[0:2] == b"DP" and rf_resp[3] == 0xA1 and rf_resp[6] == 0x01 and rf_resp[8:12] == b"DP01", rf_resp[:16].hex()
+    assert struct.unpack_from("<H", rf_resp, 62)[0] == crc16_ccitt(rf_resp[:62])
+    assert mu.mem_read(RF_CTRL + 0x0F, 1) == b"\x01", "reply not queued for the radio"
+    print("  [PASS] Test 8: Relayed request (feat[0]=0xA0, feat[2]=0x02, feat[3]=0x3A) answered and queued for 2.4 GHz")
+
+    # -------------------------------------------------------------------------
+    # TEST 9: 2.4 GHz reply length capped at 64 bytes in stock 0x15D74
+    # -------------------------------------------------------------------------
+    TXAGG = 0x20007744
+
+    def drain_rf_reply(max_polls: int = 64) -> list:
+        chunks = []
+        for _ in range(max_polls):
+            if mu.mem_read(RF_CTRL + 0x0F, 1) == b"\x00":
+                break
+            mu.mem_write(RF_CTRL + 0x10, b"\x00")  # tick delay elapsed
+            mu.mem_write(RF_CTRL + 0x13, b"\x01")  # a downlink packet arrived
+            call_thumb_at(0x00015D74)
+            n = mu.mem_read(TXAGG, 1)[0]
+            if n:
+                chunks.append(bytes(mu.mem_read(TXAGG + 1, n)))
+                mu.mem_write(TXAGG, b"\x00" * 65)
+                mu.mem_write(RF_CTRL + 0x0B, b"\x00")
+        return chunks
+
+    for status, expected_chunks in ((0xA1, 8), (0xA4, 8), (0x03, 2)):
+        resp = bytearray(range(0x80, 0xC0))
+        resp[3] = status
+        mu.mem_write(0x20004F28, bytes(resp))
+        mu.mem_write(RF_CTRL + 0x0F, b"\x01")
+        mu.mem_write(RF_CTRL + 0x12, b"\x00")
+        chunks = drain_rf_reply()
+        assert len(chunks) == expected_chunks, f"feat[3]=0x{status:02X}: {len(chunks)} chunks"
+        assert b"".join(c[1:] for c in chunks) == bytes(resp[: 8 * expected_chunks])
+        assert [c[0] >> 7 for c in chunks] == [1] * (expected_chunks - 1) + [0], "last chunk must end the reply"
+    print("  [PASS] Test 9: 2.4 GHz reply capped at 64 bytes (status 0xA1/0xA4 -> 8 chunks; stock version reply -> 2)")
+
+    print("[UNICORN] All 9 instruction-level Cortex-M4F hardware emulation tests PASSED!")
 
 
 if __name__ == "__main__":
