@@ -158,6 +158,10 @@ There are two ways in: `apply_patch.py`, the flasher and `odd_profile.py` throug
 - In the factory configuration nothing on the mouse switches profiles: no button is mapped to it and no button combination does it (Inferred: Unicorn emulation of the stock image, 2026-11-13). Only vendor software can.
 - A profile switch changes the DPI, so for a curve that applies only at one profile's DPI, tick "Only at this DPI" (`onlyAtBaseDpi`).
 
+### LED chords turned off
+
+The stock colour, speed and effect chords (Left + Middle + DPI, Middle + Back + DPI, Middle + Forward + DPI) write a 3-zone loop into a 1-zone profile and save it. On a retail mouse one press of Middle + Forward + DPI overwrote the stage count, the DPI stages, the stage colours and the left button's slot, so after a profile switch the mouse was very fast and left click did nothing until the settings page was restored (mouse-firmware-re, `firmware-subsystems.md` 2.6). The effects they cycle are never drawn by this firmware, so the patch sends these three chords to the end of the stock button handler (`0x142BE`, `0x143AC`, `0x143AE`): nothing is written or saved, and the third button's own action does not run, as in stock. Right + Middle + DPI (brightness) and the 5 s Left + Right + Middle factory reset are unchanged.
+
 ## Recovery
 
 Verified on the cable (2026-11-13, `21ea252`):
@@ -191,7 +195,7 @@ Verified on a retail mouse (2026-11-13), flashed with the read-back-verified fla
 - Commit `21ea252` (branch `fix/audit-followups`, after PR #7 was merged): decoded image SHA-256 `34d827d537816fff3e5595bbe4c7b736e6af428a724f4732307385911f422c34`, 96,992 B, `0x6000..0x1DADF`, flashed and read back with the mouse-firmware-re flasher (2026-11-13).
 - It adds the unchanged-save compare, the idle reset and the clock in `GET_CAPABILITIES` to `505404c`, the first build with the 2.4 GHz relay (SHA-256 `0ed3cb4b74d0ab5192f3708c40b25be52912c91876b973d0d8d3b821c17b794a`, 96,864 B, `0x6000..0x1DA5F`; a rebuild with Zephyr SDK 0.16.9 (gcc 12.2.0) gave the same code).
 - Verified on `21ea252` through the receiver (2026-11-13): the curve applies (up/down ratio 0.681 with up at 0.50x, against 0.938 flat in the earlier test), and a second identical `SAVE_FLASH` answers in 24 ms instead of 402 ms (no page erase, no `0xA4`).
-- No build after `21ea252` has run on hardware.
+- The LED-chord fix (branch `fix/led-chords`, 2026-11-19, image SHA-256 `29e01a5663c98fb41ffd72b95b2aa1b7ac26f1ce2444be073d1ebdbea4b6e5b7`, 96,928 B) was flashed on the cable: after one press of each of the three chords and a profile switch, every button slot, the effect and the stage colours of profile 1 read back unchanged, and all buttons worked. Earlier builds after `21ea252` (DPI-shift tracking, the debug PEEK build) also ran on this mouse on 2026-11-19.
 
 ## Compilers
 

@@ -115,6 +115,13 @@ def encode_thumb2_bl(src_addr: int, dst_addr: int) -> bytes:
     return struct.pack("<HH", hw1, hw2)
 
 
+def encode_thumb_b(src_addr: int, dst_addr: int) -> bytes:
+    """16-bit Thumb unconditional branch b.n (range +-2 KB)."""
+    off = dst_addr - (src_addr + 4)
+    assert off % 2 == 0 and -2048 <= off < 2048, f"b.n 0x{src_addr:08X} -> 0x{dst_addr:08X} out of range"
+    return struct.pack("<H", 0xE000 | ((off >> 1) & 0x7FF))
+
+
 def decode_thumb2_bl(raw4: bytes, src_addr: int) -> int:
     hw1, hw2 = struct.unpack("<HH", raw4)
     s = (hw1 >> 10) & 1
@@ -213,6 +220,14 @@ def build_patch(stock_bin: bytes, debug_peek: bool = False) -> dict:
         (0x00015DB4, "f178891d", lambda a: encode_thumb2_bl(a, clamp), "rf_len_clamp_2"),
         # sub.w r0,r0,#0x2700 -> bl note (does the sub)
         (0x00017864, "a0f51c50", lambda a: encode_thumb2_bl(a, symbols["ddpi_cpi_write_note"]), "cpi_write_note"),
+        # Stock bug: the colour, speed and effect chords (L+M+DPI 0x25, M+Back+DPI 0x2C, M+Forward+DPI 0x34)
+        # loop over 3 zones of a 1-zone profile and save stage count, stages, stage colours and button slot 0
+        # over (left button dead; seen on a retail mouse 2026-11-19). The effects they change are never drawn
+        # by this firmware, so their dispatch branches go to the function's return: the chord is swallowed,
+        # nothing written, no save. R+M+DPI (brightness) and the L+R+M factory reset are kept.
+        (0x000142BE, "40e0", lambda a: encode_thumb_b(a, 0x00014328), "chord_colour_off"),
+        (0x000143AC, "7ae016e0", lambda a: encode_thumb_b(a, 0x00014328) + encode_thumb_b(a + 2, 0x00014328),
+         "chord_speed_effect_off"),
     ]
     for addr, expected_hex, new_bytes, label in code_patches:
         file_off = addr - APP_BASE
@@ -680,7 +695,29 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict, debug_peek: bool = 
         assert peek(0x6000, 16)[3] == 0xA3, "PEEK must not exist in a normal build"
         print("  [PASS] Test 12: no debug PEEK opcode in a normal build (0x7E -> 0xA3)")
 
-    print("[UNICORN] All 12 instruction-level Cortex-M4F hardware emulation tests PASSED!")
+    # -------------------------------------------------------------------------
+    # TEST 13: the three buggy LED chords are swallowed: no profile byte changes, no save scheduled
+    # -------------------------------------------------------------------------
+    for buttons, name in (((2, 4, 5), "M+Forward+DPI"), ((2, 3, 5), "M+Back+DPI"), ((0, 2, 5), "L+M+DPI")):
+        mu.mem_write(0x200038C8, cfg)
+        mu.mem_write(0x200038C8 + 0x11, b"\x04")  # effect 4, so L+M+DPI takes its colour path in stock
+        before = bytes(mu.mem_read(0x200038C8, 0x266))
+        mu.mem_write(0x2000304C, bytes(16))  # no buttons held
+        mu.mem_write(0x20003001, b"\x00")
+        for b in buttons:
+            mu.reg_write(UC_ARM_REG_R0, 1)
+            mu.reg_write(UC_ARM_REG_R1, b)
+            call_thumb_at(0x00014244)
+        assert struct.unpack("<H", mu.mem_read(0x2000304C + 14, 2))[0] == sum(1 << b for b in buttons), "chord mask"
+        assert bytes(mu.mem_read(0x200038C8, 0x266)) == before, f"{name} changed the profile"
+        assert mu.mem_read(0x20003001, 1)[0] & 1 == 0, f"{name} scheduled a save"
+        for b in buttons:
+            mu.reg_write(UC_ARM_REG_R0, 0)
+            mu.reg_write(UC_ARM_REG_R1, b)
+            call_thumb_at(0x00014244)
+    print("  [PASS] Test 13: L+M+DPI, M+Back+DPI and M+Forward+DPI change no profile byte and schedule no save")
+
+    print("[UNICORN] All 13 instruction-level Cortex-M4F hardware emulation tests PASSED!")
 
 
 def main() -> None:
