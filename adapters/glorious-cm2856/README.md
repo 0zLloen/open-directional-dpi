@@ -58,11 +58,11 @@ compx_usb_flasher.py flash --firmware-hex adapters/build/CM2856_Mouse_USB_v1.00.
 
 To go back to stock, flash the official `.hex` the same way (verified, see [Retail mouse](#retail-mouse)). Stuck in the bootloader: see [Recovery](#recovery).
 
-What the backup and the bootloader's `Erase` cover:
+What the bootloader does with a flash (its code was read from a unit on 2026-11-19, [mouse-firmware-re `bootloader-protocol.md` section 3](https://github.com/0zLloen/mouse-firmware-re/blob/main/platforms/compx-nrf52/bootloader-protocol.md)):
 
-- The backup covers `0x6000..0x4D7FF` only (the bootloader refuses reads from `0x4D800` up), so it holds neither the saved profile (`0x7E000`) nor the pairing pages (`0x88000`+).
-- `Erase` clears `0x1E000` up to at least `0x4D7FF`, keeps `0x6000..0x1DFFF` and does not reach `0x7E000` (verified 2026-11-13); whether it reaches `0x88000`+ is unknown.
-- The patch's linker region ends at `0x1E000`, so the whole image stays in the range `Erase` keeps.
+- It writes the image to a second copy at address + `0x47800` and replaces the running application only at `Exit`. An interrupted flash leaves the old application in place; `Erase` changes no flash.
+- That second copy overlaps the saved profile page `0x7E000`, so images must end at or below `0x36800`; the flasher refuses longer ones. The patch's linker region ends at `0x1E000`.
+- The backup (`dump`) is what the bootloader returns for `0x6000..0x4D7FF`: its second copy, which equals the application after a completed flash and also holds the saved profile at offset `0x36800`.
 
 ## Load a profile (`tools/odd_profile.py`)
 
@@ -112,7 +112,7 @@ There are two ways in: `apply_patch.py`, the flasher and `odd_profile.py` throug
 
 1. Install Python 3.10 or later (python.org; on Windows tick "Add python.exe to PATH"), then the PyPI package `hidapi`: `python -m pip install hidapi` (Windows: `py -m pip install hidapi`). Not the package named `hid`, a different library; `odd_profile.py` refuses it. No udev rules or root access are needed on these systems.
 2. Get this repo and [mouse-firmware-re](https://github.com/0zLloen/mouse-firmware-re) side by side (`git clone` both into the same folder), or set `COMPX_TOOLS` to mouse-firmware-re's `platforms/compx-nrf52/tools`. Its `compx_usb_flasher.py` needs a version with `--backend hidapi`, the default there off Linux.
-3. **Do not run `compx_usb_flasher.py` (steps 3 and 5) on Windows or macOS until the bootloader's report descriptor is recorded; dump and flash from Linux until then.** Both commands switch the mouse into its bootloader (`258a:2103`), where the flasher's hidapi backend looks for the collection with usage page `0xFFFF`, usage `0`, a pair verified for the application only. If the bootloader uses another one, the mouse stays in it and only the flasher on Linux can send `Exit` ([Recovery](#recovery)).
+3. **`compx_usb_flasher.py` (steps 3 and 5) is untested on Windows and macOS; dump and flash from Linux if you can.** Both commands switch the mouse into its bootloader (`258a:2103`), where the flasher's hidapi backend looks for the collection with usage page `0xFFFF`, usage `0`. The bootloader's report descriptor has that pair (read on Linux, 2026-11-18), but no hidapi run has confirmed Windows or macOS list it that way. If they do not, the flasher writes nothing and says so; the way back is the Linux command in [Recovery](#recovery) or the official updater.
 
    Back up the mouse (from the repo root; `py` instead of `python` on Windows):
 
@@ -165,6 +165,12 @@ Verified on the cable (2026-11-13, `21ea252`):
 - DDPI `ENTER_BOOTLOADER` with the magic `"BLRS"` (`0x424C5253`) gives the bootloader `258a:2103` after 1.0 s. Without it the patch answers `0xA4` (range error) and stays in the application.
 - Holding LMB + RMB + DPI while the mouse powers up on the cable also gives `258a:2103` "Glorious bootloader". This confirms that the three pins the patch samples (P1.15, P1.13, P1.00) read low with the chord held. Which pin is which button (Left, Right, DPI) comes from the stock disassembly; this test does not tell them apart.
 - To leave the bootloader without writing anything: `compx_usb_flasher.py dump --out <new file> --end 0x6020` (reads 32 bytes, then sends Exit). It returned the mouse to `258a:2018` three times.
+
+The bootloader also has its own chord, which works whatever image is flashed (verified 2026-11-19): with the switch off and the cable unplugged, hold **Back + Forward + DPI** and plug the cable in. The mouse comes up as `258a:2103`. With the cable plugged in, the switch does not restart the mouse.
+
+### Debug build: reading memory
+
+`build_and_verify_patch.py --debug-peek` builds `CM2856_Mouse_USB_v1.00.00_OpenDDPIv1_peek.hex` with one extra command, opcode `0x7E` (`stock_ddpi_patch.c`, `DDPI_DEBUG_PEEK`, Unicorn test 12). It reads flash, FICR, UICR and RAM, and the NVMC / ACL registers, and nothing else; `peek_dump.py` drives it. It exists to read what the bootloader will not give out (the bootloader itself, the pages above `0x4D800`); that is how the bootloader was read on 2026-11-19. Any host program could read the unit's radio ID with it, so it is never released: flash the normal build back afterwards, and keep its dumps out of every repository.
 
 ## Verified on hardware
 

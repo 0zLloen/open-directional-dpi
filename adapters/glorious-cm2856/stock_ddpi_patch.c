@@ -120,6 +120,54 @@ static void ddpi_ensure_initialized(void) {
     st->init_magic = DDPI_SRAM_INIT_MAGIC;
 }
 
+#ifdef DDPI_DEBUG_PEEK
+/*
+ * Debug builds only (-DDDPI_DEBUG_PEEK, build_and_verify_patch.py --debug-peek): opcode 0x7E reads
+ * memory, for reverse engineering what the bootloader's VerifyByAddress refuses (0x0..0x5FFF and
+ * 0x4D800 up). Not part of the protocol spec and never in a release build: it would let any host
+ * program read the unit's pairing ID.
+ *   request payload:  [0..3] "PEEK", [4..7] address (u32 LE), [8] length 1..48
+ *   response payload: [0..3] address, [4] length, [5..] data; status 0xA4 outside the ranges below
+ * Ranges: flash, FICR + UICR, RAM (bytes); NVMC + ACL registers (aligned 32-bit reads only).
+ * Returns false (the core then answers 0xA3) unless the CRC and "PEEK" match.
+ */
+#define DDPI_DEBUG_OPCODE_PEEK 0x7Eu
+static bool ddpi_debug_peek(const uint8_t *req, uint8_t *resp) {
+    static const uint8_t magic[4] = {0x50u, 0x45u, 0x45u, 0x4Bu}; /* "PEEK" */
+    uint16_t crc = (uint16_t)(req[62] | ((uint16_t)req[63] << 8));
+    if (crc != ddpi_crc16_ccitt(req, 62u) || req[8] != magic[0] || req[9] != magic[1] ||
+        req[10] != magic[2] || req[11] != magic[3]) {
+        return false;
+    }
+    uint32_t addr = (uint32_t)req[12] | ((uint32_t)req[13] << 8) | ((uint32_t)req[14] << 16) | ((uint32_t)req[15] << 24);
+    uint32_t len = req[16];
+    uint32_t end = addr + len;
+    bool bytes_ok = (end <= 0x00100000u) || (addr >= 0x10000000u && end <= 0x10002000u) ||
+                    (addr >= 0x20000000u && end <= 0x20040000u);
+    bool words_ok = addr >= 0x4001E000u && end <= 0x4001F000u && ((addr | len) & 3u) == 0u;
+    bool ok = len >= 1u && len <= 48u && end > addr && (bytes_ok || words_ok);
+
+    memset(resp, 0, DDPI_HID_PACKET_LEN);
+    resp[0] = 0x44u; resp[1] = 0x50u; resp[2] = DDPI_PROFILE_VERSION;
+    resp[3] = ok ? 0xA1u : 0xA4u;
+    resp[4] = req[4]; resp[5] = DDPI_HID_NAMESPACE; resp[6] = req[6]; resp[7] = req[7];
+    if (ok) {
+        memcpy(&resp[8], &req[12], 5u);
+        if (words_ok) {
+            for (uint32_t i = 0u; i < len; i += 4u) {
+                uint32_t w = *(volatile uint32_t *)(addr + i);
+                memcpy(&resp[13u + i], &w, 4u);
+            }
+        } else {
+            memcpy(&resp[13], (const void *)addr, len);
+        }
+    }
+    crc = ddpi_crc16_ccitt(resp, 62u);
+    resp[62] = (uint8_t)crc; resp[63] = (uint8_t)(crc >> 8);
+    return true;
+}
+#endif
+
 /*
  * Stock USB Feature report epilogue helper: jumps into 0x000151F8 with
  * r4 = 0x20004F28 and r5 = 0x200032D4 so both Wired USB (memcpy to *0x200032D8)
@@ -180,6 +228,12 @@ void ddpi_usb_protocol_wrapper(void) {
             req_copy[2] = DDPI_PROFILE_VERSION;
             req_copy[3] = 0u;
         }
+#ifdef DDPI_DEBUG_PEEK
+        if (req_copy[6] == DDPI_DEBUG_OPCODE_PEEK && ddpi_debug_peek(req_copy, feat)) {
+            stock_usb_finish_response();
+            return;
+        }
+#endif
         ddpi_hid_handle_feature_report(
             &st->engine,
             req_copy,

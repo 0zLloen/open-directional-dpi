@@ -130,7 +130,7 @@ def decode_thumb2_bl(raw4: bytes, src_addr: int) -> int:
     return (src_addr + 4 + imm25) & 0xFFFFFFFF
 
 
-def build_patch(stock_bin: bytes) -> dict:
+def build_patch(stock_bin: bytes, debug_peek: bool = False) -> dict:
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     elf_path = BUILD_DIR / "stock_ddpi_patch.elf"
     bin_path = BUILD_DIR / "stock_ddpi_patch.bin"
@@ -147,6 +147,7 @@ def build_patch(stock_bin: bytes) -> dict:
         "-Wall",
         "-Wextra",
         "-Werror",
+        *(["-DDDPI_DEBUG_PEEK"] if debug_peek else []),
         f"-I{CORE_DIR}",
         f"-T{PATCH_DIR / 'stock_ddpi_patch.ld'}",
         "-Wl,--gc-sections",
@@ -261,7 +262,7 @@ def make_patch_file(stock: bytes, image: bytes, sites: list) -> dict:
     }
 
 
-def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
+def run_unicorn_verification(full_bin: bytes, symbols: dict, debug_peek: bool = False) -> None:
     from unicorn import (
         UC_ARCH_ARM,
         UC_HOOK_CODE,
@@ -655,7 +656,31 @@ def run_unicorn_verification(full_bin: bytes, symbols: dict) -> None:
         assert struct.unpack_from("<H", caps(), 26)[0] == dpi, "GET_CAPABILITIES sensor_dpi"
     print("  [PASS] Test 11: DPI shift via stock 0x14244 (press: sensor 400, curve off; release: 1200, North -100 -> -50; 0x20003068 stays 1200)")
 
-    print("[UNICORN] All 11 instruction-level Cortex-M4F hardware emulation tests PASSED!")
+    # -------------------------------------------------------------------------
+    # TEST 12: the debug read-memory opcode 0x7E: present only in a --debug-peek build
+    # -------------------------------------------------------------------------
+    def peek(addr: int, n: int, magic: bytes = b"PEEK") -> bytes:
+        mu.mem_write(0x20004F28, make_ddpi_req(0x7E, magic + struct.pack("<IB", addr, n)))
+        mu.mem_write(0x200032D4, b"\x01")
+        call_bl_site_at(0x0000E8CE)
+        resp = bytes(mu.mem_read(0x20006000, 64))
+        assert resp[0:2] == b"DP" and resp[6] == 0x7E and struct.unpack_from("<H", resp, 62)[0] == crc16_ccitt(resp[:62])
+        return resp
+
+    if debug_peek:
+        r = peek(0x00006000, 48)
+        assert r[3] == 0xA1 and r[8:13] == struct.pack("<IB", 0x6000, 48) and r[13:61] == bytes(full_bin[:48]), r.hex()
+        mu.mem_write(0x20001000, bytes(range(16)))
+        assert peek(0x20001000, 16)[13:29] == bytes(range(16))
+        for addr, n in ((0x000FFFF0, 17), (0x30000000, 4), (0x4001E001, 4), (0x4001E000, 3), (0x6000, 0), (0x6000, 49), (0xFFFFFFF0, 32)):
+            assert peek(addr, n)[3] == 0xA4, f"PEEK 0x{addr:08X}+{n} must be a range error"
+        assert peek(0x6000, 16, b"POKE")[3] == 0xA3, "wrong magic must fall through to the core (unsupported)"
+        print("  [PASS] Test 12: debug PEEK 0x7E (flash and RAM read back, 7 range errors, wrong magic -> 0xA3)")
+    else:
+        assert peek(0x6000, 16)[3] == 0xA3, "PEEK must not exist in a normal build"
+        print("  [PASS] Test 12: no debug PEEK opcode in a normal build (0x7E -> 0xA3)")
+
+    print("[UNICORN] All 12 instruction-level Cortex-M4F hardware emulation tests PASSED!")
 
 
 def main() -> None:
@@ -664,6 +689,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stock-hex", type=Path, help="official CM2856_Mouse_USB_v1.00.00_20220810.hex or a dump .hex "
                     "of a mouse on stock v1.0.0.0 (compx_usb_flasher.py dump), instead of adapters/stock/*.bin")
+    ap.add_argument("--debug-peek", action="store_true", help="debug image with the read-memory opcode 0x7E "
+                    "(stock_ddpi_patch.c, DDPI_DEBUG_PEEK); outputs get a _peek suffix. Never publish or release it")
     args = ap.parse_args()
 
     missing = [t for t in (ARM_GCC, ARM_OBJCOPY, ARM_NM, ARM_OBJDUMP) if shutil.which(t) is None]
@@ -676,14 +703,15 @@ def main() -> None:
         sys.exit("unicorn not installed (pip install unicorn): the emulation tests are required")
 
     # A failed run must not leave a flashable image, old or new: write only after every check passed
-    out_bin_path = BUILD_DIR / "CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.bin"
-    out_hex_path = BUILD_DIR / "CM2856_Mouse_USB_v1.00.00_OpenDDPIv1.hex"
-    out_json_path = BUILD_DIR / "OpenDDPIv1-patch.json"
+    suffix = "_peek" if args.debug_peek else ""
+    out_bin_path = BUILD_DIR / f"CM2856_Mouse_USB_v1.00.00_OpenDDPIv1{suffix}.bin"
+    out_hex_path = BUILD_DIR / f"CM2856_Mouse_USB_v1.00.00_OpenDDPIv1{suffix}.hex"
+    out_json_path = BUILD_DIR / f"OpenDDPIv1-patch{suffix}.json"
     for path in (out_bin_path, out_hex_path, out_json_path):
         path.unlink(missing_ok=True)
     stock = load_stock_image(args.stock_hex)
-    info = build_patch(stock)
-    run_unicorn_verification(info["full_bin"], info["symbols"])
+    info = build_patch(stock, args.debug_peek)
+    run_unicorn_verification(info["full_bin"], info["symbols"], args.debug_peek)
     patch_json = json.dumps(make_patch_file(stock, info["full_bin"], info["sites"]), indent=1) + "\n"
     for path, data in ((out_bin_path, info["full_bin"]), (out_hex_path, info["hex_text"].encode("ascii")),
                        (out_json_path, patch_json.encode("ascii"))):
